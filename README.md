@@ -1,4 +1,4 @@
-# jev-local
+# jev-japanese-judgment
 
 日本語データセットを「判定（judgment）」形式に変換し、非自己回帰的に確率付きの判定を返す小型モデルを作るプロジェクト。
 
