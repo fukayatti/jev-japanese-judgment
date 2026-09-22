@@ -1,11 +1,16 @@
 """Colab上でvLLMを使い、拡張候補(言い換え/自然なリライト/ダミー選択肢)をバッチ生成するスクリプト。
 
 ローカル環境では実行しない想定 (vllmはColab専用、requirements.txtではコメントアウト)。
-guided decodingのAPI名はvLLMのバージョンで変わることがあるので、
-実行時にインストール済みバージョンのドキュメントで要確認。
+実際のvLLM推論は data/augment/vllm_worker.py を subprocess として起動して行う
+(ノートブックセル内で直接 vllm.LLM(...) を呼ぶとCUDA初期化済みプロセスからの
+spawnでデッドロックすることがあるため)。
 """
 
-from pydantic import BaseModel
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 from data.augment.prompts import DISTRACTOR_PROMPT, PARAPHRASE_PROMPT, REWRITE_NATURAL_PROMPT
 from data.convert.schema import JevExample
@@ -14,10 +19,6 @@ from data.convert.schema import JevExample
 # 正しいIDは "Qwen/Qwen3.5-4B" (Qwen3.5-4B-Baseのchat/instructチューン版、Apache 2.0)。
 # image-text-to-text対応モデルだが、テキストのみのプロンプトでも問題なく使える。
 AUGMENT_MODEL = "Qwen/Qwen3.5-4B"  # or Sarashina2.2, or LFM2.5-1.2B-JP
-
-
-class _TextOutput(BaseModel):
-    text: str
 
 
 def build_prompts(examples: list[JevExample]) -> list[dict]:
@@ -42,19 +43,21 @@ def build_prompts(examples: list[JevExample]) -> list[dict]:
 
 
 def run_batch_generation(jobs: list[dict], model_name: str = AUGMENT_MODEL) -> list[dict]:
-    from vllm import LLM, SamplingParams
+    """vllm_worker.pyをsubprocessとして起動し、結果をJSON経由で受け取る。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = Path(tmpdir) / "jobs.json"
+        output_path = Path(tmpdir) / "results.json"
 
-    llm = LLM(model=model_name, gpu_memory_utilization=0.9, max_model_len=2048)
-    sampling_params = SamplingParams(
-        temperature=0.7,
-        max_tokens=256,
-        guided_decoding=_TextOutput.model_json_schema(),
-    )
-    outputs = llm.generate([job["prompt"] for job in jobs], sampling_params)
-    results = []
-    for job, output in zip(jobs, outputs):
-        results.append({**job, "output": output.outputs[0].text})
-    return results
+        with input_path.open("w", encoding="utf-8") as f:
+            json.dump(jobs, f, ensure_ascii=False)
+
+        subprocess.run(
+            [sys.executable, "-m", "data.augment.vllm_worker", str(input_path), str(output_path), model_name],
+            check=True,
+        )
+
+        with output_path.open(encoding="utf-8") as f:
+            return json.load(f)
 
 
 if __name__ == "__main__":
