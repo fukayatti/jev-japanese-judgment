@@ -35,10 +35,17 @@ class JevModel(nn.Module):
         # dtypeを明示しないと、チェックポイントのbfloat16のまま読み込まれ、
         # デフォルトfloat32で初期化される自作ヘッド(JevScoringHead)との間で
         # dtypeが食い違い、F.linearで"mat1 and mat2 must have the same dtype"
-        # になる。T4はbfloat16のネイティブサポートが弱いのでfloat16を使い、
-        # ヘッド側もバックボーンの実際のdtypeに合わせて自動的に揃える
-        # (float32に統一するとメモリが倍近くになりOOMしやすくなる)。
-        self.backbone = AutoModel.from_pretrained(base_model_name, dtype=torch.float16)
+        # になる。
+        #
+        # float16に統一したところ学習1バッチ目からloss=nanになった。LFM2.5は
+        # 元々bfloat16でチェックポイントされたモデルで、bfloat16はfloat32と
+        # 同じ指数部レンジを持つが、float16は表現できる最大値が約65504までしか
+        # ない。bfloat16前提の重み・活性化をfloat16に押し込むとforward1回目
+        # から容易にオーバーフローしてinf/nanになる。T4(Turing, CC7.5)は
+        # bfloat16のテンソルコア高速化こそ無いが、CUDAコアでの演算自体は
+        # サポートしているので、精度を優先してbfloat16に戻す
+        # (float32よりはメモリ半分で済み、float16より数値的に安全)。
+        self.backbone = AutoModel.from_pretrained(base_model_name, dtype=torch.bfloat16)
         hidden_size = self.backbone.config.hidden_size
         self.head = JevScoringHead(hidden_size).to(dtype=self.backbone.dtype)
 
