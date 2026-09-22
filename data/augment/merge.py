@@ -38,22 +38,44 @@ def merge_augmentations(examples: list[JevExample], results: list[dict]) -> list
     parsed = filter_format(parsed)
 
     augmented: list[JevExample] = []
+    dropped = 0
     for r in parsed:
         base = examples_by_id.get(r["example_id"])
         if base is None:
             continue
+        text = r["output"]
 
         if r["kind"] in ("paraphrase", "rewrite_natural"):
-            augmented.append(
-                base.model_copy(update={"id": f"{base.id}_{r['kind']}", "question": r["output"]})
-            )
+            # 元の質問文のコピーはリライトになっていないので捨てる。
+            # 元の2.5倍以上長い場合は、無関係な文を書き足すハルシネーションの
+            # 疑いが強いので捨てる(実データで「別の質問を捏造する」事例を確認済み)。
+            if text == base.question:
+                dropped += 1
+                continue
+            if len(text) > len(base.question) * 1.8:
+                dropped += 1
+                continue
+            augmented.append(base.model_copy(update={"id": f"{base.id}_{r['kind']}", "question": text}))
+
         elif r["kind"] == "distractor":
-            if r["output"] in base.candidates:
+            # ダミー選択肢のはずが質問文をまるごと返す事例を実データで確認済み。
+            # 「？」を含む(=質問文っぽい)、または既存候補より極端に長い場合は
+            # 短い答えの候補になっていないとみなして捨てる。
+            if text in base.candidates:
+                dropped += 1
+                continue
+            if "？" in text or "?" in text:
+                dropped += 1
+                continue
+            max_candidate_len = max(len(c) for c in base.candidates)
+            if len(text) > max_candidate_len * 2:
+                dropped += 1
                 continue
             augmented.append(
-                base.model_copy(
-                    update={"id": f"{base.id}_distractor", "candidates": base.candidates + [r["output"]]}
-                )
+                base.model_copy(update={"id": f"{base.id}_distractor", "candidates": base.candidates + [text]})
             )
+
+    if dropped:
+        print(f"merge_augmentations: dropped {dropped} low-quality results")
 
     return augmented
