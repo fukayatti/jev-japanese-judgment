@@ -56,13 +56,18 @@ def run_batch_generation(jobs: list[dict], model_name: str = AUGMENT_MODEL) -> l
             capture_output=True,
             text=True,
         )
-        # stdout/stderrはそのまま表示しつつ、失敗時は末尾をエラーメッセージにも含める
-        # (Colabのセル出力だと何が原因か分かりにくいことがあるため)
-        print(proc.stdout)
-        print(proc.stderr, file=sys.stderr)
+        # vLLMのtqdm進捗バーはTTYでないと1回の更新ごとに改行付きの新しい行になり、
+        # 数千件処理すると出力が膨大になる。成功時に全部出すとColabの表示上限で
+        # 後続の出力(呼び出し元のresults[:5]のprintなど)が埋もれてしまうため、
+        # 失敗時のみ末尾を出す。
         if proc.returncode != 0:
-            tail = "\n".join(proc.stderr.strip().splitlines()[-30:])
-            raise RuntimeError(f"vllm_worker failed (exit={proc.returncode}). stderr tail:\n{tail}")
+            stdout_tail = "\n".join(proc.stdout.strip().splitlines()[-30:])
+            stderr_tail = "\n".join(proc.stderr.strip().splitlines()[-30:])
+            raise RuntimeError(
+                f"vllm_worker failed (exit={proc.returncode}).\n"
+                f"stdout tail:\n{stdout_tail}\n\nstderr tail:\n{stderr_tail}"
+            )
+        print(f"vllm_worker completed ({len(jobs)} jobs)")
 
         with output_path.open(encoding="utf-8") as f:
             return json.load(f)
