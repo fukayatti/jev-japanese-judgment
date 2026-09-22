@@ -1,5 +1,7 @@
 """JevModelの学習スクリプト。listwise cross-entropyでヘッドとLoRAアダプタを学習する。"""
 
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
@@ -36,7 +38,34 @@ def build_model() -> JevModel:
     return model
 
 
-def train_one_epoch(model: JevModel, dataloader: DataLoader, optimizer: torch.optim.Optimizer, device: str) -> float:
+def save_checkpoint(model: JevModel, checkpoint_dir: Path, tag: str) -> None:
+    """学習対象(LoRAアダプタ+自作ヘッド)だけを保存する。凍結済みバックボーン本体は
+    保存不要(容量の無駄、かつHubから再ダウンロードできる)。
+    optimizerの状態は保存しない(再開時はoptimizerの運動量情報がリセットされる、
+    という制約はあるが、セッション切断で全部消えるよりはずっとまし)。
+    """
+    path = checkpoint_dir / tag
+    path.mkdir(parents=True, exist_ok=True)
+    model.backbone.save_pretrained(path / "lora")
+    torch.save(model.head.state_dict(), path / "head.pt")
+
+
+def load_checkpoint(model: JevModel, checkpoint_dir: Path, tag: str) -> None:
+    from peft import PeftModel
+
+    path = checkpoint_dir / tag
+    model.backbone = PeftModel.from_pretrained(model.backbone.get_base_model(), path / "lora", is_trainable=True)
+    model.head.load_state_dict(torch.load(path / "head.pt", map_location="cpu"))
+
+
+def train_one_epoch(
+    model: JevModel,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: str,
+    checkpoint_dir: Path | None = None,
+    checkpoint_every_steps: int = 200,
+) -> float:
     model.train()
     total_loss = 0.0
     # epoch単位でしか出力がないと、1エポックがGPUでも数分〜数十分かかる規模の
@@ -58,10 +87,25 @@ def train_one_epoch(model: JevModel, dataloader: DataLoader, optimizer: torch.op
 
         total_loss += loss.item()
         progress.set_postfix(loss=f"{total_loss / step:.4f}")
+
+        # 1エポックが数時間かかりうる規模なので、エポック境界だけの保存だと
+        # Colabのセッション切断で数時間分の進捗が丸ごと消えかねない。
+        # "latest"を定期的に上書き保存し、ディスク使用量も一定に保つ。
+        if checkpoint_dir is not None and step % checkpoint_every_steps == 0:
+            save_checkpoint(model, checkpoint_dir, "latest")
+
     return total_loss / len(dataloader)
 
 
-def main(train_examples, val_examples=None, epochs: int = 3, batch_size: int = 16, lr: float = 2e-4):
+def main(
+    train_examples,
+    val_examples=None,
+    epochs: int = 3,
+    batch_size: int = 16,
+    lr: float = 2e-4,
+    checkpoint_dir: str | None = None,
+    checkpoint_every_steps: int = 200,
+):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
     # 実際に流れるのは batch_size × 候補数(最大5) 系列なので、512は必要以上に
@@ -75,9 +119,15 @@ def main(train_examples, val_examples=None, epochs: int = 3, batch_size: int = 1
     train_loader = DataLoader(train_examples, batch_size=batch_size, shuffle=True, collate_fn=collator)
     print(f"training on {len(train_examples)} examples, {len(train_loader)} batches/epoch, device={device}")
 
+    ckpt_path = Path(checkpoint_dir) if checkpoint_dir else None
+    if ckpt_path:
+        print(f"checkpointing to {ckpt_path} every {checkpoint_every_steps} steps and at each epoch end")
+
     for epoch in range(epochs):
-        avg_loss = train_one_epoch(model, train_loader, optimizer, device)
+        avg_loss = train_one_epoch(model, train_loader, optimizer, device, ckpt_path, checkpoint_every_steps)
         print(f"epoch {epoch + 1}/{epochs} loss={avg_loss:.4f}")
+        if ckpt_path:
+            save_checkpoint(model, ckpt_path, f"epoch{epoch + 1}")
 
     return model
 
