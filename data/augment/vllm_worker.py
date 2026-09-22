@@ -26,7 +26,16 @@ def main(input_path: str, output_path: str, model_name: str) -> None:
     with open(input_path, encoding="utf-8") as f:
         jobs = json.load(f)
 
-    llm = LLM(model=model_name, gpu_memory_utilization=0.9, max_model_len=2048)
+    # T4(16GB)だとQwen3.5-4Bは重み8.6GiBだけでほぼ埋まり、CUDAグラフキャプチャ
+    # (51バッチサイズ分の一時バッファ)でOOMする。enforce_eager=Trueでグラフ
+    # キャプチャ自体を無効化する(1回きりのバッチ生成なので多少遅くても問題ない)。
+    # max_model_lenも短いプロンプトしか使わないので余裕を持って下げておく。
+    llm = LLM(
+        model=model_name,
+        gpu_memory_utilization=0.85,
+        max_model_len=1024,
+        enforce_eager=True,
+    )
     sampling_params = SamplingParams(
         temperature=0.7,
         max_tokens=256,
