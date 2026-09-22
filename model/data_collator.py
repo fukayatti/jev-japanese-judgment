@@ -9,6 +9,13 @@ from data.convert.schema import JevExample
 class JevDataCollator:
     def __init__(self, tokenizer: PreTrainedTokenizerBase, max_length: int = 512):
         self.tokenizer = tokenizer
+        # model/head.py の最終トークン抽出 (attention_mask.sum(dim=1) - 1) は
+        # 右パディング前提。デコーダ系トークナイザーは生成用に左パディングが
+        # デフォルトのことがあるため、ここで明示的に右パディングを強制する。
+        self.tokenizer.padding_side = "right"
+        if self.tokenizer.pad_token is None:
+            # デコーダ系トークナイザーはpad_token未設定のことが多い
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         self.max_length = max_length
 
     def __call__(self, examples: list[JevExample]) -> dict:
