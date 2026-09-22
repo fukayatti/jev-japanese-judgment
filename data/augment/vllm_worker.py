@@ -36,10 +36,15 @@ def main(input_path: str, output_path: str, model_name: str) -> None:
         max_model_len=1024,
         enforce_eager=True,
     )
+    # vLLM v0.30.0ではAPIが "guided_decoding" から "structured_outputs" に
+    # 改名されており、SamplingParams(guided_decoding=...) はTypeErrorになる。
+    # 正しくは StructuredOutputsParams(json=schema) を渡す。
+    from vllm.sampling_params import StructuredOutputsParams
+
     sampling_params = SamplingParams(
         temperature=0.7,
         max_tokens=256,
-        guided_decoding=_TextOutput.model_json_schema(),
+        structured_outputs=StructuredOutputsParams(json=_TextOutput.model_json_schema()),
     )
     outputs = llm.generate([job["prompt"] for job in jobs], sampling_params)
 
