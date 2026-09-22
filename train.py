@@ -24,6 +24,14 @@ LORA_CONFIG = LoraConfig(
 def build_model() -> JevModel:
     model = JevModel(BASE_MODEL_NAME)
     model.backbone = get_peft_model(model.backbone, LORA_CONFIG)
+    # LoRAだけ学習でも、勾配を通すには16層分のforward時の中間活性化を全部
+    # 保持する必要があり、batch_size×候補数(最大5)を束ねると意外とVRAMを
+    # 食う(T4でCUDA OOMを確認済み)。gradient checkpointingで再計算に倒して
+    # メモリを節約する。PEFTでフリーズしたバックボーンに対して有効にするには
+    # enable_input_require_grads()も必要(これが無いと勾配がLoRA層まで
+    # 伝播しないことがある)。
+    model.backbone.gradient_checkpointing_enable()
+    model.backbone.enable_input_require_grads()
     return model
 
 
@@ -47,10 +55,13 @@ def train_one_epoch(model: JevModel, dataloader: DataLoader, optimizer: torch.op
     return total_loss / len(dataloader)
 
 
-def main(train_examples, val_examples=None, epochs: int = 3, batch_size: int = 8, lr: float = 2e-4):
+def main(train_examples, val_examples=None, epochs: int = 3, batch_size: int = 4, lr: float = 2e-4):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
-    collator = JevDataCollator(tokenizer)
+    # 実際に流れるのは batch_size × 候補数(最大5) 系列なので、512は必要以上に
+    # 大きい(実データの質問文・chABSAの文はほとんどこれよりずっと短い)。
+    # OOM対策としてgradient checkpointingに加えてここも絞っておく。
+    collator = JevDataCollator(tokenizer, max_length=256)
 
     model = build_model().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
