@@ -7,7 +7,7 @@
 import os
 
 import pandas as pd
-from datasets import Dataset
+from datasets import Dataset, load_dataset
 
 from data.convert.schema import JevExample
 
@@ -37,3 +37,13 @@ def _get_hf_token() -> str:
 def push(examples: list[JevExample], repo_id: str, private: bool = False) -> None:
     dataset = to_dataset(examples)
     dataset.push_to_hub(repo_id, token=_get_hf_token(), private=private)
+
+
+def pull(repo_id: str, split: str = "train") -> list[JevExample]:
+    """公開済みデータセットをHFから取得し、JevExampleのリストに戻す。
+
+    データ変換・LLM拡張・マージを毎回やり直さずに、一度pushしたデータセットから
+    学習だけ再開したい場合に使う。
+    """
+    ds = load_dataset(repo_id, split=split)
+    return [JevExample(**row) for row in ds]
