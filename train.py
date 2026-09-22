@@ -1,0 +1,67 @@
+"""JevModelの学習スクリプト。listwise cross-entropyでヘッドとLoRAアダプタを学習する。"""
+
+import torch
+import torch.nn.functional as F
+from peft import LoraConfig, get_peft_model
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
+
+from model.data_collator import JevDataCollator
+from model.head import BASE_MODEL_NAME, JevModel
+
+# target_modulesはLFM2の実際のモジュール名(model.backbone.named_modules()で確認)に
+# 合わせて調整すること。conv層とattention層で名前が異なる可能性がある。
+LORA_CONFIG = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    bias="none",
+)
+
+
+def build_model() -> JevModel:
+    model = JevModel(BASE_MODEL_NAME)
+    model.backbone = get_peft_model(model.backbone, LORA_CONFIG)
+    return model
+
+
+def train_one_epoch(model: JevModel, dataloader: DataLoader, optimizer: torch.optim.Optimizer, device: str) -> float:
+    model.train()
+    total_loss = 0.0
+    for batch in dataloader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        num_candidates = batch["num_candidates"].to(device)
+        labels = batch["labels"].to(device)
+
+        logits = model(input_ids, attention_mask, num_candidates)
+        loss = F.cross_entropy(logits, labels)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+    return total_loss / len(dataloader)
+
+
+def main(train_examples, val_examples=None, epochs: int = 3, batch_size: int = 8, lr: float = 2e-4):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
+    collator = JevDataCollator(tokenizer)
+
+    model = build_model().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    train_loader = DataLoader(train_examples, batch_size=batch_size, shuffle=True, collate_fn=collator)
+
+    for epoch in range(epochs):
+        avg_loss = train_one_epoch(model, train_loader, optimizer, device)
+        print(f"epoch {epoch + 1}/{epochs} loss={avg_loss:.4f}")
+
+    return model
+
+
+if __name__ == "__main__":
+    raise SystemExit("train_examples/val_examples を用意してから main() を呼び出すこと")

@@ -1,0 +1,12 @@
+torch>=2.3
+transformers>=4.45
+peft>=0.13
+datasets>=2.20
+accelerate>=0.34
+pydantic>=2.8
+scikit-learn>=1.5
+numpy>=1.26
+pandas>=2.2
+
+# Colab (LLM拡張ステップ) のみで使用
+# vllm>=0.6
