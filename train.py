@@ -9,13 +9,14 @@ from transformers import AutoTokenizer
 from model.data_collator import JevDataCollator
 from model.head import BASE_MODEL_NAME, JevModel
 
-# target_modulesはLFM2の実際のモジュール名(model.backbone.named_modules()で確認)に
-# 合わせて調整すること。conv層とattention層で名前が異なる可能性がある。
+# transformers.models.lfm2.modeling_lfm2 のソースで確認済みの実モジュール名。
+# Lfm2Attention: q_proj, k_proj, v_proj, out_proj (Llama系の"o_proj"ではない)
+# Lfm2ShortConv (conv層): in_proj, out_proj
 LORA_CONFIG = LoraConfig(
     r=16,
     lora_alpha=32,
     lora_dropout=0.05,
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    target_modules=["q_proj", "k_proj", "v_proj", "out_proj", "in_proj"],
     bias="none",
 )
 
