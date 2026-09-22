@@ -1,61 +1,56 @@
 """chABSA-dataset -> Jev形式の決定論的変換。
 
-元データ (https://github.com/chakki-works/chABSA-dataset, JSON):
-  各ファイルが1社の決算短信。
-  {
-    "sentences": [
-      {
-        "sentence": str,
-        "opinions": [
-          {"target": str, "category": str, "polarity": "positive"|"negative"|"neutral", ...},
-          ...
-        ]
-      },
-      ...
-    ]
-  }
+原著作者: TIS株式会社 (https://github.com/chakki-works/chABSA-dataset, CC BY 4.0)
 
-1つの sentence に複数の opinion (target) がある場合、target ごとに1つのJevExampleを作る。
-polarity の正確な取りうる値・表記は実データで要確認 (TODO)。
+公式配布 (S3上のzip) は確認時点でリンク切れ (NoSuchBucket) だったため、
+コミュニティミラー "zenless-lab/chABSA" (Hugging Face, 元データをparquet化したもの、
+2572/643件のtrain/test分割あり) 経由で取得する。CC BY 4.0なので
+ミラー経由でも原著作者のクレジットを保てば利用可能。
+
+スキーマ (ミラー側でflatten済み、1行=1文):
+  document_id, document_name, doc_text, edi_id, security_code,
+  category33, category17, sentence_id, sentence,
+  opinions: list[{from, to, label, polarity, text}]
+    - text: 評価対象のtarget文字列 (元のJSON仕様の "target" に相当)
+    - polarity: "positive" | "negative" | "neutral"  (実データで確認済み)
+
+1つのsentenceに複数opinionがある場合、opinionごとに1つのJevExampleを作る。
 """
 
-import json
-from pathlib import Path
+from datasets import load_dataset
 
 from data.convert.schema import JevExample
+
+MIRROR_DATASET = "zenless-lab/chABSA"
 
 _POLARITY_LABELS = ["positive", "negative", "neutral"]
 _POLARITY_CANDIDATES_JA = ["ポジティブ", "ネガティブ", "中立"]
 
 
-def convert(json_dir: Path) -> list[JevExample]:
+def convert(split: str = "train") -> list[JevExample]:
+    ds = load_dataset(MIRROR_DATASET, split=split)
     examples = []
-    for path in sorted(json_dir.glob("*.json")):
-        data = json.loads(path.read_text(encoding="utf-8"))
-        for s_idx, sentence in enumerate(data["sentences"]):
-            for o_idx, opinion in enumerate(sentence.get("opinions", [])):
-                polarity = opinion["polarity"]
-                if polarity not in _POLARITY_LABELS:
-                    # TODO: 実データで想定外の極性表記が出たら要対応
-                    continue
-                label = _POLARITY_LABELS.index(polarity)
-                examples.append(
-                    JevExample(
-                        id=f"chabsa_{path.stem}_{s_idx}_{o_idx}",
-                        source_dataset="chabsa",
-                        context=sentence["sentence"],
-                        question=f"「{opinion['target']}」についての評価は？",
-                        candidates=list(_POLARITY_CANDIDATES_JA),
-                        label=label,
-                        task_type="sentiment",
-                    )
+    for row in ds:
+        for o_idx, opinion in enumerate(row["opinions"]):
+            polarity = opinion["polarity"]
+            if polarity not in _POLARITY_LABELS:
+                continue
+            label = _POLARITY_LABELS.index(polarity)
+            examples.append(
+                JevExample(
+                    id=f"chabsa_{row['document_id']}_{row['sentence_id']}_{o_idx}",
+                    source_dataset="chabsa",
+                    context=row["sentence"],
+                    question=f"「{opinion['text']}」についての評価は？",
+                    candidates=list(_POLARITY_CANDIDATES_JA),
+                    label=label,
+                    task_type="sentiment",
                 )
+            )
     return examples
 
 
 if __name__ == "__main__":
-    import sys
-
-    examples = convert(Path(sys.argv[1]))
+    examples = convert("train")
     print(f"converted {len(examples)} examples")
-    print(examples[0] if examples else "no examples found")
+    print(examples[0])
