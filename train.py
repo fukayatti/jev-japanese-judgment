@@ -61,7 +61,7 @@ def train_one_epoch(model: JevModel, dataloader: DataLoader, optimizer: torch.op
     return total_loss / len(dataloader)
 
 
-def main(train_examples, val_examples=None, epochs: int = 3, batch_size: int = 4, lr: float = 2e-4):
+def main(train_examples, val_examples=None, epochs: int = 3, batch_size: int = 16, lr: float = 2e-4):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
     # 実際に流れるのは batch_size × 候補数(最大5) 系列なので、512は必要以上に
