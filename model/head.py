@@ -32,7 +32,11 @@ class JevScoringHead(nn.Module):
 class JevModel(nn.Module):
     def __init__(self, base_model_name: str = BASE_MODEL_NAME):
         super().__init__()
-        self.backbone = AutoModel.from_pretrained(base_model_name)
+        # dtypeを明示しないと、チェックポイントのbfloat16のまま読み込まれ、
+        # float32で初期化される自作ヘッド(JevScoringHead)との間でdtypeが
+        # 食い違い、F.linearで "mat1 and mat2 must have the same dtype" になる。
+        # T4はbfloat16のネイティブサポートが弱いこともあり、float32に統一する。
+        self.backbone = AutoModel.from_pretrained(base_model_name, dtype=torch.float32)
         hidden_size = self.backbone.config.hidden_size
         self.head = JevScoringHead(hidden_size)
 
