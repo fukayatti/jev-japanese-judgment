@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from model.data_collator import JevDataCollator
@@ -38,7 +39,11 @@ def build_model() -> JevModel:
 def train_one_epoch(model: JevModel, dataloader: DataLoader, optimizer: torch.optim.Optimizer, device: str) -> float:
     model.train()
     total_loss = 0.0
-    for batch in dataloader:
+    # epoch単位でしか出力がないと、1エポックがGPUでも数分〜数十分かかる規模の
+    # データ(数万件)では「本当にハングしているのか、ただ時間がかかっているだけか」
+    # 区別がつかない。バッチ単位の進捗バーで可視化する。
+    progress = tqdm(dataloader, desc="train", unit="batch")
+    for step, batch in enumerate(progress, start=1):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         num_candidates = batch["num_candidates"].to(device)
@@ -52,6 +57,7 @@ def train_one_epoch(model: JevModel, dataloader: DataLoader, optimizer: torch.op
         optimizer.step()
 
         total_loss += loss.item()
+        progress.set_postfix(loss=f"{total_loss / step:.4f}")
     return total_loss / len(dataloader)
 
 
@@ -67,6 +73,7 @@ def main(train_examples, val_examples=None, epochs: int = 3, batch_size: int = 4
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
     train_loader = DataLoader(train_examples, batch_size=batch_size, shuffle=True, collate_fn=collator)
+    print(f"training on {len(train_examples)} examples, {len(train_loader)} batches/epoch, device={device}")
 
     for epoch in range(epochs):
         avg_loss = train_one_epoch(model, train_loader, optimizer, device)
