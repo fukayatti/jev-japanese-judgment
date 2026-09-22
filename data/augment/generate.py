@@ -10,7 +10,10 @@ from pydantic import BaseModel
 from data.augment.prompts import DISTRACTOR_PROMPT, PARAPHRASE_PROMPT, REWRITE_NATURAL_PROMPT
 from data.convert.schema import JevExample
 
-AUGMENT_MODEL = "Qwen/Qwen3-4B-Instruct"  # or Sarashina2.2, or LFM2.5-1.2B-JP
+# "Qwen/Qwen3-4B-Instruct" は存在しないリポジトリ名だった(404)。
+# 正しいIDは "Qwen/Qwen3.5-4B" (Qwen3.5-4B-Baseのchat/instructチューン版、Apache 2.0)。
+# image-text-to-text対応モデルだが、テキストのみのプロンプトでも問題なく使える。
+AUGMENT_MODEL = "Qwen/Qwen3.5-4B"  # or Sarashina2.2, or LFM2.5-1.2B-JP
 
 
 class _TextOutput(BaseModel):
