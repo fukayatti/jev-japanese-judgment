@@ -51,10 +51,18 @@ def run_batch_generation(jobs: list[dict], model_name: str = AUGMENT_MODEL) -> l
         with input_path.open("w", encoding="utf-8") as f:
             json.dump(jobs, f, ensure_ascii=False)
 
-        subprocess.run(
+        proc = subprocess.run(
             [sys.executable, "-m", "data.augment.vllm_worker", str(input_path), str(output_path), model_name],
-            check=True,
+            capture_output=True,
+            text=True,
         )
+        # stdout/stderrはそのまま表示しつつ、失敗時は末尾をエラーメッセージにも含める
+        # (Colabのセル出力だと何が原因か分かりにくいことがあるため)
+        print(proc.stdout)
+        print(proc.stderr, file=sys.stderr)
+        if proc.returncode != 0:
+            tail = "\n".join(proc.stderr.strip().splitlines()[-30:])
+            raise RuntimeError(f"vllm_worker failed (exit={proc.returncode}). stderr tail:\n{tail}")
 
         with output_path.open(encoding="utf-8") as f:
             return json.load(f)
