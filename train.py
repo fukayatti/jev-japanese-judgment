@@ -1,5 +1,6 @@
 """JevModelの学習スクリプト。listwise cross-entropyでヘッドとLoRAアダプタを学習する。"""
 
+import json
 from pathlib import Path
 
 import torch
@@ -40,24 +41,34 @@ def build_model(use_gradient_checkpointing: bool = True) -> JevModel:
     return model
 
 
-def save_checkpoint(model: JevModel, checkpoint_dir: Path, tag: str) -> None:
+def save_checkpoint(model: JevModel, checkpoint_dir: Path, tag: str, completed_epochs: int = 0) -> None:
     """学習対象(LoRAアダプタ+自作ヘッド)だけを保存する。凍結済みバックボーン本体は
     保存不要(容量の無駄、かつHubから再ダウンロードできる)。
     optimizerの状態は保存しない(再開時はoptimizerの運動量情報がリセットされる、
     という制約はあるが、セッション切断で全部消えるよりはずっとまし)。
+
+    completed_epochs: このチェックポイント時点で完全に終わっているepoch数。
+    エポック途中の"latest"保存では、今取り組んでいる(まだ終わっていない)
+    epochのインデックスを渡す(=そのepochの頭からやり直す、という意味になる。
+    shuffleするDataLoaderでバッチ単位の正確な再開は実用上の意味が薄いので、
+    epoch単位の粒度に割り切っている)。
     """
     path = checkpoint_dir / tag
     path.mkdir(parents=True, exist_ok=True)
     model.backbone.save_pretrained(path / "lora")
     torch.save(model.head.state_dict(), path / "head.pt")
+    (path / "meta.json").write_text(json.dumps({"completed_epochs": completed_epochs}))
 
 
-def load_checkpoint(model: JevModel, checkpoint_dir: Path, tag: str) -> None:
+def load_checkpoint(model: JevModel, checkpoint_dir: Path, tag: str) -> dict:
     from peft import PeftModel
 
     path = checkpoint_dir / tag
     model.backbone = PeftModel.from_pretrained(model.backbone.get_base_model(), path / "lora", is_trainable=True)
     model.head.load_state_dict(torch.load(path / "head.pt", map_location="cpu"))
+
+    meta_path = path / "meta.json"
+    return json.loads(meta_path.read_text()) if meta_path.exists() else {"completed_epochs": 0}
 
 
 def train_one_epoch(
@@ -67,6 +78,7 @@ def train_one_epoch(
     device: str,
     checkpoint_dir: Path | None = None,
     checkpoint_every_steps: int = 200,
+    current_epoch_index: int = 0,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -94,7 +106,7 @@ def train_one_epoch(
         # Colabのセッション切断で数時間分の進捗が丸ごと消えかねない。
         # "latest"を定期的に上書き保存し、ディスク使用量も一定に保つ。
         if checkpoint_dir is not None and step % checkpoint_every_steps == 0:
-            save_checkpoint(model, checkpoint_dir, "latest")
+            save_checkpoint(model, checkpoint_dir, "latest", completed_epochs=current_epoch_index)
 
     return total_loss / len(dataloader)
 
@@ -108,7 +120,11 @@ def main(
     checkpoint_dir: str | None = None,
     checkpoint_every_steps: int = 200,
     use_gradient_checkpointing: bool = True,
+    resume_from: str | None = None,
 ):
+    """resume_from: 再開したいチェックポイントのtag("latest"や"epoch2"等)。
+    checkpoint_dir配下にそのtagのディレクトリが無いと失敗する。
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
     # 実際に流れるのは batch_size × 候補数(最大5) 系列なので、512は必要以上に
@@ -125,11 +141,20 @@ def main(
     if ckpt_path:
         print(f"checkpointing to {ckpt_path} every {checkpoint_every_steps} steps and at each epoch end")
 
-    for epoch in range(epochs):
-        avg_loss = train_one_epoch(model, train_loader, optimizer, device, ckpt_path, checkpoint_every_steps)
+    start_epoch = 0
+    if resume_from:
+        if ckpt_path is None:
+            raise ValueError("resume_from を使うには checkpoint_dir も指定すること")
+        meta = load_checkpoint(model, ckpt_path, resume_from)
+        model = model.to(device)  # load_checkpointでbackboneを差し替えているので再度移動
+        start_epoch = meta["completed_epochs"]
+        print(f"resumed from '{resume_from}': {start_epoch} epoch(s) already completed, optimizerは初期状態から再開")
+
+    for epoch in range(start_epoch, epochs):
+        avg_loss = train_one_epoch(model, train_loader, optimizer, device, ckpt_path, checkpoint_every_steps, epoch)
         print(f"epoch {epoch + 1}/{epochs} loss={avg_loss:.4f}")
         if ckpt_path:
-            save_checkpoint(model, ckpt_path, f"epoch{epoch + 1}")
+            save_checkpoint(model, ckpt_path, f"epoch{epoch + 1}", completed_epochs=epoch + 1)
 
     return model
 
