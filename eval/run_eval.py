@@ -93,24 +93,23 @@ def evaluate(model, examples, device: str = "cuda", batch_size: int = 16, max_le
 
 
 # データセット全体での最大候補数(JCommonsenseQAが5択、chABSA/JSNLIは3値)。
-# キャリブレーション指標(ECE/Brier/NLL)は固定幅のlogits/labelsテンソルを前提と
-# しているので、バッチごとに異なるK_maxをこの値まで-infでパディングして揃える。
-GLOBAL_MAX_CANDIDATES = 5
-
-
 @torch.no_grad()
 def collect_logits(
     model, examples, device: str = "cuda", batch_size: int = 16, max_length: int = 256
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """calibration指標を計算するため、全examplesのlogitsとlabelsを1つのテンソルに集約する。
-    バッチごとにK_maxが異なりうる(候補数3のexampleだけのバッチ、5のexampleを含むバッチ等)ので、
-    GLOBAL_MAX_CANDIDATESまで-infパディングしてから結合する
-    (-infはsoftmaxで確率0になるので、ECE/Brier/NLLの計算結果は変わらない)。
+    バッチごとにK_maxが異なりうる(候補数3のexampleだけのバッチ、5のexampleを含むバッチ、
+    distractor拡張で6になったexample等)ので、examples全体の実際の最大候補数まで-infで
+    パディングしてから結合する(-infはsoftmaxで確率0になるので、ECE/Brier/NLLの計算結果は
+    変わらない)。固定値で決め打ちすると、拡張データで候補数が増えた場合に壊れる
+    (実際にJCommonsenseQA+distractorで6択になるケースで形状エラーが発生した)。
     """
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
     collator = JevDataCollator(tokenizer, max_length=max_length)
     loader = DataLoader(examples, batch_size=batch_size, shuffle=False, collate_fn=collator)
+
+    global_max_k = max(len(ex.candidates) for ex in examples)
 
     all_logits = []
     all_labels = []
@@ -122,8 +121,8 @@ def collect_logits(
 
         logits = model(input_ids, attention_mask, num_candidates).float().cpu()
         k = logits.size(1)
-        if k < GLOBAL_MAX_CANDIDATES:
-            pad = torch.full((logits.size(0), GLOBAL_MAX_CANDIDATES - k), float("-inf"))
+        if k < global_max_k:
+            pad = torch.full((logits.size(0), global_max_k - k), float("-inf"))
             logits = torch.cat([logits, pad], dim=1)
 
         all_logits.append(logits)
