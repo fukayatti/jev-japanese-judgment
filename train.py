@@ -41,7 +41,7 @@ def build_model(use_gradient_checkpointing: bool = True) -> JevModel:
     return model
 
 
-def save_checkpoint(model: JevModel, checkpoint_dir: Path, tag: str, completed_epochs: int = 0) -> None:
+def save_checkpoint(model: JevModel, checkpoint_dir: Path | str, tag: str, completed_epochs: int = 0) -> None:
     """学習対象(LoRAアダプタ+自作ヘッド)だけを保存する。凍結済みバックボーン本体は
     保存不要(容量の無駄、かつHubから再ダウンロードできる)。
     optimizerの状態は保存しない(再開時はoptimizerの運動量情報がリセットされる、
@@ -53,17 +53,17 @@ def save_checkpoint(model: JevModel, checkpoint_dir: Path, tag: str, completed_e
     shuffleするDataLoaderでバッチ単位の正確な再開は実用上の意味が薄いので、
     epoch単位の粒度に割り切っている)。
     """
-    path = checkpoint_dir / tag
+    path = Path(checkpoint_dir) / tag
     path.mkdir(parents=True, exist_ok=True)
     model.backbone.save_pretrained(path / "lora")
     torch.save(model.head.state_dict(), path / "head.pt")
     (path / "meta.json").write_text(json.dumps({"completed_epochs": completed_epochs}))
 
 
-def load_checkpoint(model: JevModel, checkpoint_dir: Path, tag: str) -> dict:
+def load_checkpoint(model: JevModel, checkpoint_dir: Path | str, tag: str) -> dict:
     from peft import PeftModel
 
-    path = checkpoint_dir / tag
+    path = Path(checkpoint_dir) / tag
     model.backbone = PeftModel.from_pretrained(model.backbone.get_base_model(), path / "lora", is_trainable=True)
     model.head.load_state_dict(torch.load(path / "head.pt", map_location="cpu"))
 
