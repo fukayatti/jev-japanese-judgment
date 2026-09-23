@@ -1,7 +1,7 @@
-"""チェックポイントを読み込んでホールドアウトセットでaccuracyを測る。
+"""チェックポイントを読み込んでホールドアウトセットでaccuracy/calibrationを測る。
 
 エポックの途中でも"latest"チェックポイントで精度を確認できるようにするための
-軽量な評価ドライバ。calibration(ECE等)まではやらず、まずは正解率の確認用。
+軽量な評価ドライバ。
 """
 
 from collections import defaultdict
@@ -90,3 +90,43 @@ def evaluate(model, examples, device: str = "cuda", batch_size: int = 16, max_le
         result[f"{task}_accuracy"] = task_correct[task] / task_total[task]
         result[f"{task}_n"] = task_total[task]
     return result
+
+
+# データセット全体での最大候補数(JCommonsenseQAが5択、chABSA/JSNLIは3値)。
+# キャリブレーション指標(ECE/Brier/NLL)は固定幅のlogits/labelsテンソルを前提と
+# しているので、バッチごとに異なるK_maxをこの値まで-infでパディングして揃える。
+GLOBAL_MAX_CANDIDATES = 5
+
+
+@torch.no_grad()
+def collect_logits(
+    model, examples, device: str = "cuda", batch_size: int = 16, max_length: int = 256
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """calibration指標を計算するため、全examplesのlogitsとlabelsを1つのテンソルに集約する。
+    バッチごとにK_maxが異なりうる(候補数3のexampleだけのバッチ、5のexampleを含むバッチ等)ので、
+    GLOBAL_MAX_CANDIDATESまで-infパディングしてから結合する
+    (-infはsoftmaxで確率0になるので、ECE/Brier/NLLの計算結果は変わらない)。
+    """
+    model.eval()
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
+    collator = JevDataCollator(tokenizer, max_length=max_length)
+    loader = DataLoader(examples, batch_size=batch_size, shuffle=False, collate_fn=collator)
+
+    all_logits = []
+    all_labels = []
+    for batch in loader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        num_candidates = batch["num_candidates"].to(device)
+        labels = batch["labels"]
+
+        logits = model(input_ids, attention_mask, num_candidates).float().cpu()
+        k = logits.size(1)
+        if k < GLOBAL_MAX_CANDIDATES:
+            pad = torch.full((logits.size(0), GLOBAL_MAX_CANDIDATES - k), float("-inf"))
+            logits = torch.cat([logits, pad], dim=1)
+
+        all_logits.append(logits)
+        all_labels.append(labels)
+
+    return torch.cat(all_logits, dim=0), torch.cat(all_labels, dim=0)
