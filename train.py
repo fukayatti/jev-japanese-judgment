@@ -41,23 +41,31 @@ def build_model(use_gradient_checkpointing: bool = True) -> JevModel:
     return model
 
 
-def save_checkpoint(model: JevModel, checkpoint_dir: Path | str, tag: str, completed_epochs: int = 0) -> None:
+def save_checkpoint(
+    model: JevModel,
+    checkpoint_dir: Path | str,
+    tag: str,
+    completed_epochs: int = 0,
+    completed_steps_in_epoch: int = 0,
+) -> None:
     """学習対象(LoRAアダプタ+自作ヘッド)だけを保存する。凍結済みバックボーン本体は
     保存不要(容量の無駄、かつHubから再ダウンロードできる)。
     optimizerの状態は保存しない(再開時はoptimizerの運動量情報がリセットされる、
     という制約はあるが、セッション切断で全部消えるよりはずっとまし)。
 
     completed_epochs: このチェックポイント時点で完全に終わっているepoch数。
-    エポック途中の"latest"保存では、今取り組んでいる(まだ終わっていない)
-    epochのインデックスを渡す(=そのepochの頭からやり直す、という意味になる。
-    shuffleするDataLoaderでバッチ単位の正確な再開は実用上の意味が薄いので、
-    epoch単位の粒度に割り切っている)。
+    completed_steps_in_epoch: 今取り組んでいる(まだ終わっていない)epoch内で
+    処理済みのバッチ数。再開時にこの数だけバッチをスキップし、無駄なforward/
+    backwardの再計算を避ける(DataLoaderはshuffleするので「全く同じバッチ」を
+    スキップするわけではないが、SGDにとっては十分同等)。
     """
     path = Path(checkpoint_dir) / tag
     path.mkdir(parents=True, exist_ok=True)
     model.backbone.save_pretrained(path / "lora")
     torch.save(model.head.state_dict(), path / "head.pt")
-    (path / "meta.json").write_text(json.dumps({"completed_epochs": completed_epochs}))
+    (path / "meta.json").write_text(
+        json.dumps({"completed_epochs": completed_epochs, "completed_steps_in_epoch": completed_steps_in_epoch})
+    )
 
 
 def load_checkpoint(model: JevModel, checkpoint_dir: Path | str, tag: str) -> dict:
@@ -68,7 +76,11 @@ def load_checkpoint(model: JevModel, checkpoint_dir: Path | str, tag: str) -> di
     model.head.load_state_dict(torch.load(path / "head.pt", map_location="cpu"))
 
     meta_path = path / "meta.json"
-    return json.loads(meta_path.read_text()) if meta_path.exists() else {"completed_epochs": 0}
+    default = {"completed_epochs": 0, "completed_steps_in_epoch": 0}
+    if not meta_path.exists():
+        return default
+    meta = json.loads(meta_path.read_text())
+    return {**default, **meta}
 
 
 def train_one_epoch(
@@ -79,14 +91,22 @@ def train_one_epoch(
     checkpoint_dir: Path | None = None,
     checkpoint_every_steps: int = 200,
     current_epoch_index: int = 0,
+    skip_steps: int = 0,
 ) -> float:
     model.train()
     total_loss = 0.0
+    total_batches = len(dataloader)
     # epoch単位でしか出力がないと、1エポックがGPUでも数分〜数十分かかる規模の
     # データ(数万件)では「本当にハングしているのか、ただ時間がかかっているだけか」
     # 区別がつかない。バッチ単位の進捗バーで可視化する。
-    progress = tqdm(dataloader, desc="train", unit="batch")
+    progress = tqdm(dataloader, desc="train", unit="batch", initial=skip_steps, total=total_batches)
+    processed = 0
     for step, batch in enumerate(progress, start=1):
+        if step <= skip_steps:
+            # 前回の中断前に処理済みのバッチ。collate(トークナイズ)のCPUコストは
+            # 避けられないが、一番重いforward/backward(GPU計算)はスキップできる。
+            continue
+
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         num_candidates = batch["num_candidates"].to(device)
@@ -100,15 +120,18 @@ def train_one_epoch(
         optimizer.step()
 
         total_loss += loss.item()
-        progress.set_postfix(loss=f"{total_loss / step:.4f}")
+        processed += 1
+        progress.set_postfix(loss=f"{total_loss / processed:.4f}")
 
         # 1エポックが数時間かかりうる規模なので、エポック境界だけの保存だと
         # Colabのセッション切断で数時間分の進捗が丸ごと消えかねない。
         # "latest"を定期的に上書き保存し、ディスク使用量も一定に保つ。
         if checkpoint_dir is not None and step % checkpoint_every_steps == 0:
-            save_checkpoint(model, checkpoint_dir, "latest", completed_epochs=current_epoch_index)
+            save_checkpoint(
+                model, checkpoint_dir, "latest", completed_epochs=current_epoch_index, completed_steps_in_epoch=step
+            )
 
-    return total_loss / len(dataloader)
+    return total_loss / max(1, processed)
 
 
 def main(
@@ -142,16 +165,25 @@ def main(
         print(f"checkpointing to {ckpt_path} every {checkpoint_every_steps} steps and at each epoch end")
 
     start_epoch = 0
+    resume_skip_steps = 0
     if resume_from:
         if ckpt_path is None:
             raise ValueError("resume_from を使うには checkpoint_dir も指定すること")
         meta = load_checkpoint(model, ckpt_path, resume_from)
         model = model.to(device)  # load_checkpointでbackboneを差し替えているので再度移動
         start_epoch = meta["completed_epochs"]
-        print(f"resumed from '{resume_from}': {start_epoch} epoch(s) already completed, optimizerは初期状態から再開")
+        resume_skip_steps = meta["completed_steps_in_epoch"]
+        print(
+            f"resumed from '{resume_from}': {start_epoch} epoch(s) completed, "
+            f"skipping {resume_skip_steps} step(s) into epoch {start_epoch + 1} "
+            "(optimizerは初期状態から再開)"
+        )
 
     for epoch in range(start_epoch, epochs):
-        avg_loss = train_one_epoch(model, train_loader, optimizer, device, ckpt_path, checkpoint_every_steps, epoch)
+        skip_steps = resume_skip_steps if epoch == start_epoch else 0
+        avg_loss = train_one_epoch(
+            model, train_loader, optimizer, device, ckpt_path, checkpoint_every_steps, epoch, skip_steps
+        )
         print(f"epoch {epoch + 1}/{epochs} loss={avg_loss:.4f}")
         if ckpt_path:
             save_checkpoint(model, ckpt_path, f"epoch{epoch + 1}", completed_epochs=epoch + 1)
