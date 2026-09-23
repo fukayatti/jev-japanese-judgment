@@ -22,6 +22,24 @@ def load_model_from_checkpoint(checkpoint_dir, tag: str, device: str = "cuda"):
     return model.to(device)
 
 
+def load_model_from_hub(repo_id: str, device: str = "cuda"):
+    """公開済みのHugging Faceモデルリポジトリから直接読み込む。
+    push_model()がcheckpoint_dir/tag配下(lora/, head.pt)の中身をそのまま
+    リポジトリのルートにアップロードしているので、ダウンロード後のパスも
+    load_checkpointと同じ構造(lora/, head.pt)になっている。
+    """
+    from huggingface_hub import snapshot_download
+    from peft import PeftModel
+
+    local_dir = snapshot_download(repo_id)
+    model = build_model(use_gradient_checkpointing=False)
+    model.backbone = PeftModel.from_pretrained(
+        model.backbone.get_base_model(), f"{local_dir}/lora", is_trainable=False
+    )
+    model.head.load_state_dict(torch.load(f"{local_dir}/head.pt", map_location="cpu"))
+    return model.to(device)
+
+
 @torch.no_grad()
 def predict(model, examples: list[JevExample], device: str = "cuda", max_length: int = 256) -> list[dict]:
     """1件〜数件のexampleについて、候補ごとの確率を返す。手作業での動作確認用。"""
