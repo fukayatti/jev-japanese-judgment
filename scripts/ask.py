@@ -33,6 +33,15 @@ def load(repo_id: str = DEFAULT_REPO_ID, device: str = "cuda", quantize: bool = 
     ("qlinear_dynamic (ONEDNN): data type of input should be float" で実際に
     エラーになった)、モデルの重み自体をbfloat16からfloat32へキャストしてから
     量子化する。
+
+    全Linear層を一律量子化すると、held-out 200件でoverall accuracy 97.0%→89.0%、
+    特にnliタスクが93.7%→79.7%と大きく劣化することを実測で確認した。LFM2.5は
+    16層中6層だけがself_attn(残り10層はconv)、feed_forwardは16層全部にある
+    (実際のnamed_modulesで確認済み: layers.N.self_attn.{q,k,v,out}_proj,
+    layers.N.conv.{in,out}_proj, layers.N.feed_forward.{w1,w2,w3})。
+    計算量の大半を占めるfeed_forward/conv層だけ量子化し、層数が少なく精度に
+    効いていそうなself_attn層は全精度のまま残す(qconfig_specに量子化したい
+    層の名前だけを明示的に列挙する形で、self_attnを除外する)。
     """
     if quantize and device != "cpu":
         raise ValueError("動的量子化はCPU向けなので device='cpu' と併用すること")
@@ -41,7 +50,13 @@ def load(repo_id: str = DEFAULT_REPO_ID, device: str = "cuda", quantize: bool = 
     if quantize:
         model.backbone = model.backbone.merge_and_unload()
         model = model.float()
-        model = torch.ao.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+
+        qconfig_spec = {
+            name: torch.ao.quantization.default_dynamic_qconfig
+            for name, module in model.named_modules()
+            if isinstance(module, torch.nn.Linear) and "self_attn" not in name
+        }
+        model = torch.ao.quantization.quantize_dynamic(model, qconfig_spec, dtype=torch.qint8)
     return model
 
 
