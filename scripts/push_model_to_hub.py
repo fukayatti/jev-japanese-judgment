@@ -120,11 +120,11 @@ python -m scripts.ask --device cpu --quantize --question "..." --candidates "...
 
 | 指標 | 値 |
 | --- | --- |
-| Accuracy | {accuracy} |
+| Accuracy (overall) | {accuracy} |
 | ECE (Expected Calibration Error) | {ece} |
 | Brier score | {brier} |
 | NLL | {nll} |
-
+{task_breakdown}
 フル精度(bf16)と比べて数%の精度劣化があり、特にNLIタスクで大きい。
 試行錯誤の詳細は `scripts/ask.py` の `load()` docstringと `qat.py` を参照。
 """
@@ -208,6 +208,17 @@ def _append_quantized_section_to_card(api: HfApi, repo_id: str, eval_results: di
     readme_path = hf_hub_download(repo_id=repo_id, filename="README.md", repo_type="model", token=api.token)
     card = Path(readme_path).read_text(encoding="utf-8")
 
+    task_names = sorted(
+        key[: -len("_accuracy")] for key in eval_results if key.endswith("_accuracy") and key != "overall_accuracy"
+    )
+    task_breakdown = ""
+    if task_names:
+        rows = "\n".join(
+            f"| {task} | {eval_results[f'{task}_accuracy']} | {eval_results.get(f'{task}_n', 'N/A')} |"
+            for task in task_names
+        )
+        task_breakdown = f"\n| タスク別 accuracy | 値 | n |\n| --- | --- | --- |\n{rows}\n"
+
     marker = "\n## 量子化版(ローカルPC/CPU向け)\n"
     card = card.split(marker)[0]
     card += marker + QUANTIZED_SECTION_TEMPLATE.format(
@@ -217,6 +228,7 @@ def _append_quantized_section_to_card(api: HfApi, repo_id: str, eval_results: di
         ece=eval_results.get("ece", "N/A"),
         brier=eval_results.get("brier", "N/A"),
         nll=eval_results.get("nll", "N/A"),
+        task_breakdown=task_breakdown,
     )
     api.upload_file(
         path_or_fileobj=card.encode("utf-8"),
