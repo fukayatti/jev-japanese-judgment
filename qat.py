@@ -29,18 +29,24 @@ from eval.run_eval import load_model_from_checkpoint
 from model.data_collator import JevDataCollator
 from model.head import BASE_MODEL_NAME, JevModel
 
-QAT_BACKEND = "qnnpack"  # ARM系。x86 CPUなら'x86'に変えること
 
+def prepare_qat_model(model: JevModel) -> JevModel:
+    """LoRAをマージし、量子化対象層だけ凍結解除+fake quant準備する。それ以外は全部凍結。
 
-def prepare_qat_model(model: JevModel, backend: str = QAT_BACKEND) -> JevModel:
-    """LoRAをマージし、量子化対象層だけ凍結解除+fake quant準備する。それ以外は全部凍結。"""
+    get_default_qat_qconfig()(静的QAT)を使うと、convert後に quantized::linear
+    (活性化も事前に量子化されている前提の静的演算)になり、CPU上でも
+    "NotImplementedError: Could not run 'quantized::linear' with arguments
+    from the 'CPU' backend" になった(QuantStub/DeQuantStubを挟んでいないため)。
+    PTQで実績のある quantized::linear_dynamic に変換されるよう、
+    default_dynamic_qat_qconfig(学習時は重みだけfake quant、活性化は動的)を使う。
+    """
     model.backbone = model.backbone.merge_and_unload()
     model = model.float()
 
     for p in model.parameters():
         p.requires_grad = False
 
-    qat_qconfig = torch.ao.quantization.get_default_qat_qconfig(backend)
+    qat_qconfig = torch.ao.quantization.default_dynamic_qat_qconfig
     target_count = 0
     for name, module in model.backbone.named_modules():
         if isinstance(module, torch.nn.Linear) and "self_attn" not in name:
@@ -51,7 +57,13 @@ def prepare_qat_model(model: JevModel, backend: str = QAT_BACKEND) -> JevModel:
 
     print(f"QAT target linear layers: {target_count}")
     model.backbone.train()  # prepare_qatはtrainingモード必須
-    model.backbone = torch.ao.quantization.prepare_qat(model.backbone, inplace=False)
+    # prepare_qatのデフォルトmapping(DEFAULT_QAT_MODULE_MAPPINGS)は
+    # nn.Linear -> nn.qat.Linear(静的QAT用)にしてしまう。動的QATにしたいので
+    # nn.qat.dynamic.Linearを明示的に指定する。
+    import torch.ao.nn.qat.dynamic as nnqatd
+
+    qat_mapping = {torch.nn.Linear: nnqatd.Linear}
+    model.backbone = torch.ao.quantization.prepare_qat(model.backbone, mapping=qat_mapping, inplace=False)
     model.backbone.gradient_checkpointing_enable()
     model.backbone.enable_input_require_grads()
     return model
@@ -119,9 +131,24 @@ def _save_qat_checkpoint(model: JevModel, checkpoint_dir: str, tag: str, step: i
 
 
 def convert_qat_model(model: JevModel) -> JevModel:
-    """fake quantizeで学習した重みを、実際のint8量子化モデルに変換する。"""
+    """fake quantizeで学習した重みを、実際のint8量子化モデルに変換する。
+    量子化バックエンド(CPU向け)は他のGPU上のテンソルと混在できないため、
+    変換前にモデル全体をCPUへ移しておく(self_attn等の非量子化部分がCUDAに
+    残ったままだと、evaluate時に"Expected all tensors to be on the same
+    device"で落ちる)。
+
+    convert()のデフォルトmappingは静的量子化用で、そのままだと
+    quantized::linear(活性化側もQuantStub/DeQuantStubで事前量子化されている
+    前提の演算)になり、"NotImplementedError: Could not run 'quantized::linear'
+    ... from the 'CPU' backend"になる。PTQで実績のあるquantized::linear_dynamic
+    に変換されるよう、動的量子化用mappingを明示的に指定する。
+    """
+    from torch.ao.quantization.quantization_mappings import get_default_dynamic_quant_module_mappings
+
+    model = model.to("cpu")
     model.eval()
-    model.backbone = torch.ao.quantization.convert(model.backbone.eval(), inplace=False)
+    dynamic_mapping = get_default_dynamic_quant_module_mappings()
+    model.backbone = torch.ao.quantization.convert(model.backbone.eval(), mapping=dynamic_mapping, inplace=False)
     return model
 
 
