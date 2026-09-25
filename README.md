@@ -37,6 +37,56 @@
 - `baselines.py`: 多数派クラス、ヘッド改造前のプロンプトベースライン
 - `speed.py`: 推論レイテンシ（このヘッド方式 vs 自己回帰JSON生成）
 
+## 公開物
+
+- データセット / モデル（LoRA + ヘッド、GGUF、量子化版）: [fukayatti0/jev-japanese-judgment](https://huggingface.co/fukayatti0/jev-japanese-judgment)（Hugging Face Hub）
+
+## 結果
+
+held-out（学習に使っていないデータ）での評価。
+
+| 項目 | 値 |
+| --- | --- |
+| Accuracy（epoch1、held-out） | 93.8% |
+| ECE（キャリブレーション誤差） | 1.14% |
+
+## ローカルPCで動かす（GPU不要）
+
+量子化方式ごとの精度（held-out 200件、`scripts/ask.py` の `load()` と `scripts/gguf_pipeline.py` で測定）:
+
+| 方式 | サイズ | Accuracy |
+| --- | --- | --- |
+| bf16（基準、GPU） | 約2.3GB | 97.0% |
+| **GGUF Q8_0 + LoRA**（llama.cpp） | 1.2GB | 97.0% |
+| **GGUF Q4_0 + LoRA**（llama.cpp） | 664MB | 96.5% |
+| **GGUF Q4_K_M + LoRA**（llama.cpp） | 698MB | 95.5% |
+| PyTorch 動的int8（per-channel、CPU） | - | 89.5% |
+
+n=200なので誤差は約±1.3ポイント（Q4_0とQ4_K_Mの優劣は判別できない）。PyTorchの動的int8は精度が大きく落ちるため、ローカル実行にはGGUF版を推奨する。選択的量子化・QAT・ONNXも試したが、精度悪化または変換不可で不採用（`qat.py`、`scripts/ask.py` のdocstringに経緯を記載）。
+
+### GGUF版（推奨）
+
+llama.cppでバックボーン+LoRAを動かし（`--pooling last` で最終トークンのhidden stateを取得）、自作ヘッド（小さなMLP）はPython側で計算する。llama.cppのC++側の改造は不要。
+
+```bash
+# 1. llama.cppをビルド（初回のみ）
+git clone --depth 1 https://github.com/ggml-org/llama.cpp
+cd llama.cpp && cmake -B build -DLLAMA_CURL=OFF && cmake --build build -j2 --target llama-embedding && cd ..
+
+# 2. 質問する（Python標準ライブラリのみ、モデルは初回に自動ダウンロード）
+python3 scripts/ask_gguf_lite.py --llama-embedding llama.cpp/build/bin/llama-embedding \
+  --question "日本の首都はどこ？" --candidates "大阪,東京,京都,名古屋"
+```
+
+`scripts/ask_gguf.py` はnumpy + huggingface_hubを使う同等版。`--quant Q8_0` などで量子化タイプを選べる（初回のみ追加ダウンロード）。GGUF変換・評価・公開は `python -m scripts.gguf_pipeline`（Colab想定）。
+
+### PyTorch版（GPUあり / 量子化CPU）
+
+```bash
+python -m scripts.ask --question "日本の首都はどこ？" --candidates "大阪,東京,京都,名古屋"
+python -m scripts.ask --device cpu --quantize ...   # 動的int8（精度は下がる）
+```
+
 ## Colabでの実行
 
 `notebooks/colab_launcher.ipynb` はこのリポジトリを clone して依存をインストールするだけの薄いランチャー。実際のロジックは全てこのリポジトリのモジュールに置く。学習済みチェックポイントや生成データはGoogle Drive/Hugging Face Hubに保存し、gitにはコードのみを置く。
@@ -45,3 +95,4 @@
 
 - コード: MIT (`LICENSE`)
 - 変換済みデータセット: CC BY-SA 4.0（Hugging Face Hub公開時に別途表示）
+- モデル: ベースの [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-1.2B-JP-202606/blob/main/LICENSE) に従う（GGUF版は量子化したベース重みを含む）
