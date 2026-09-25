@@ -67,12 +67,12 @@ def head_score(w: dict, x: list[float]) -> float:
     return sum(map(operator.mul, w["mlp.2.weight"][1], hidden)) + w["mlp.2.bias"][1][0]
 
 
-def embed(binary: str, model: Path, lora: Path, texts: list[str], threads: int) -> list[list[float]]:
+def embed(binary: str, model: Path, lora: Path | None, texts: list[str], threads: int) -> list[list[float]]:
     with tempfile.TemporaryDirectory() as tmp:
         pf = Path(tmp) / "prompts.txt"
         pf.write_text(SEP.join(texts), encoding="utf-8")
         cmd = [
-            binary, "-m", model, "--lora", lora, "-f", pf, "--embd-separator", SEP,
+            binary, "-m", model, *(["--lora", lora] if lora else []), "-f", pf, "--embd-separator", SEP,
             "--pooling", "last", "--embd-normalize", "-1", "--embd-output-format", "json",
             "-t", threads, "-c", 2048, "-b", 2048, "-ub", 2048, "-ngl", 0, "--no-warmup",
         ]
@@ -90,15 +90,18 @@ def _main() -> None:
     ap.add_argument("--model", type=Path, help="ベースGGUFのパス(省略時はHubから取得)")
     ap.add_argument("--lora", type=Path, help="LoRA GGUFのパス")
     ap.add_argument("--head", type=Path, help="head.npzのパス")
+    ap.add_argument("--no-lora", action="store_true", help="LoRAを使わない(--modelがLoRAマージ済みの場合)")
     ap.add_argument("--threads", type=int, default=4)
     a = ap.parse_args()
     if not a.llama_embedding:
         raise SystemExit("llama-embedding が見つからない。--llama-embedding で指定すること")
 
-    if not (a.model and a.lora and a.head):
-        a.model = a.model or fetch(f"lfm2-base-{a.quant}.gguf")
+    a.model = a.model or fetch(f"lfm2-base-{a.quant}.gguf")
+    a.head = a.head or fetch("head.npz")
+    if a.no_lora:
+        a.lora = None
+    else:
         a.lora = a.lora or fetch("jev-lora-f16.gguf")
-        a.head = a.head or fetch("head.npz")
 
     candidates = [c.strip() for c in a.candidates.split(",") if c.strip()]
     texts = [f"{a.context}\n{a.question}\n{c}" for c in candidates]

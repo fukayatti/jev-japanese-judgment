@@ -97,7 +97,7 @@ def export_head_npz(p: Paths) -> None:
 class GGUFScorer:
     """llama-embeddingでpooled vectorを取り、numpyでヘッドを計算する。"""
 
-    def __init__(self, model: Path, lora: Path, embedding_bin: Path, head_npz: Path, threads: int = 4):
+    def __init__(self, model: Path, lora: Path | None, embedding_bin: Path, head_npz: Path, threads: int = 4):
         self.model = model
         self.lora = lora
         self.embedding_bin = embedding_bin
@@ -114,7 +114,7 @@ class GGUFScorer:
             pf = Path(tmp) / "prompts.txt"
             pf.write_text(SEP.join(texts), encoding="utf-8")
             cmd = [
-                self.embedding_bin, "-m", self.model, "--lora", self.lora,
+                self.embedding_bin, "-m", self.model, *(["--lora", self.lora] if self.lora else []),
                 "-f", pf, "--embd-separator", SEP, "--pooling", "last", "--embd-normalize", "-1",
                 "--embd-output-format", "json", "-t", self.threads, "-c", 2048, "-b", 2048, "-ub", 2048,
                 "-ngl", 0, "--no-warmup",
