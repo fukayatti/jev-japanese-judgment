@@ -30,6 +30,11 @@ def main() -> None:
     ap.add_argument("--option-mode", default="label", choices=["label", "criteria"])
     a = ap.parse_args()
 
+    missing = [f"{name}: {path}" for name, path in (("--gguf", a.gguf), ("--head", a.head), ("--server", a.server),
+                                                   ("--jevbench", a.jevbench)) if not Path(path).exists()]
+    if missing:
+        raise SystemExit("次のパスが存在しない(Colabのセッションが作り直されて /content が消えた可能性):\n  " + "\n  ".join(missing))
+
     repo = Path(__file__).resolve().parents[2]
     # JevBench側に置いたアダプタのコピーは、このリポジトリをpullしても更新されない。実行のたびに入れ直して古いコピーを使わない
     subprocess.run([sys.executable, str(Path(__file__).with_name("install.py")), str(a.jevbench)], check=True)
