@@ -1,8 +1,8 @@
 """GGUF版Jevモデルに質問を投げる、Python標準ライブラリだけ版(numpy/torch不要)。
 
-必要なもの: ビルド済みの llama.cpp の `llama-embedding`。モデルファイルは
---model/--lora/--head で直接指定するか、省略してHugging Face Hubから取得する
-(取得時のみ huggingface_hub が必要)。
+必要なもの: ビルド済みの llama.cpp の `llama-embedding` だけ。モデルファイルは
+--model/--lora/--head で直接指定するか、省略するとHugging Face Hubから
+~/.cache/jev-gguf/ にダウンロードする(標準ライブラリのurllibを使うので追加インストール不要)。
 
 使い方:
   python scripts/ask_gguf_lite.py --llama-embedding /path/to/llama-embedding \\
@@ -18,12 +18,27 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import urllib.request
 import zipfile
 from array import array
 from pathlib import Path
 
 REPO_ID = "fukayatti0/jev-japanese-judgment"
 SEP = "<#sep#>"
+
+
+def fetch(name: str) -> Path:
+    dest = Path.home() / ".cache" / "jev-gguf" / name
+    if dest.exists():
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    url = f"https://huggingface.co/{REPO_ID}/resolve/main/gguf/{name}"
+    print(f"downloading {url}", flush=True)
+    part = dest.with_name(dest.name + ".part")
+    with urllib.request.urlopen(url) as r, open(part, "wb") as out:
+        shutil.copyfileobj(r, out, 1 << 20)
+    part.rename(dest)
+    return dest
 
 
 def _read_npy(raw: bytes) -> tuple[tuple, array]:
@@ -81,9 +96,6 @@ def _main() -> None:
         raise SystemExit("llama-embedding が見つからない。--llama-embedding で指定すること")
 
     if not (a.model and a.lora and a.head):
-        from huggingface_hub import hf_hub_download
-
-        fetch = lambda name: Path(hf_hub_download(REPO_ID, f"gguf/{name}"))
         a.model = a.model or fetch(f"lfm2-base-{a.quant}.gguf")
         a.lora = a.lora or fetch("jev-lora-f16.gguf")
         a.head = a.head or fetch("head.npz")
