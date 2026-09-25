@@ -40,6 +40,7 @@
 ## 公開物
 
 - データセット / モデル（LoRA + ヘッド、GGUF、量子化版）: [fukayatti0/jev-japanese-judgment](https://huggingface.co/fukayatti0/jev-japanese-judgment)（Hugging Face Hub）
+- v2（noul/score追加学習版、LoRA+ヘッド、GGUF Q4_K_M/Q8_0）: [fukayatti0/jev-japanese-judgment-v2](https://huggingface.co/fukayatti0/jev-japanese-judgment-v2)
 
 ## 結果
 
@@ -112,7 +113,7 @@ python -m scripts.ask --device cpu --quantize ...   # 動的int8（精度は下�
 `integrations/jevbench/` のアダプタで、GGUF（Q4_K_M、LoRAマージ済み）を llama-server（T4 GPU）で動かして測定。
 測ったのは公開階層（easy 48 / original 72 / hard 111問）の正解率で、非公開の階層と総合スコアは測っていない。
 
-| 階層 | v1（公開中） | v2（noul/score追加学習、未公開） |
+| 階層 | v1 | v2（noul/score追加学習） |
 | --- | --- | --- |
 | easy | 87.5%（42/48） | 93.8%（45/48） |
 | original | 51.4%（37/72） | 50.0%（36/72） |
