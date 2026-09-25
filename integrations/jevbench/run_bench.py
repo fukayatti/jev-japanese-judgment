@@ -8,6 +8,7 @@
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -42,6 +43,8 @@ def main() -> None:
         results.unlink(missing_ok=True)
         ledger = out / f"{tier}_ledger.jsonl"
         ledger.unlink(missing_ok=True)
+        # JevBenchはrawレスポンスを排他作成(xb)で書くので、前回の残りがあるとFileExistsErrorになる
+        shutil.rmtree(out / f"{tier}_raw", ignore_errors=True)
         run = [sys.executable, "-m", "jevbench.cli", "run", "--adapter", "jev_gguf_local", "--endpoint", a.gguf,
                "--model", a.label, "--tasks", tasks, "--results", str(results), "--ledger", str(ledger),
                "--raw-dir", str(out / f"{tier}_raw")]
