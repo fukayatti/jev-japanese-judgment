@@ -87,6 +87,47 @@ def eval_checkpoint(examples: list[JevExample], checkpoint_dir: str, tag: str) -
     print(f"{checkpoint_dir}/{tag}:", _metrics(model, examples))
 
 
+def build_calibration(eval_paths: list[Path], seed: int = 1, n_per_task: int = 300, raw_dir: Path = Path("data/raw/jsnli")) -> list[JevExample]:
+    """温度スケーリングで温度を決めるための、評価セットとは重ならない未使用データ。
+    評価セット(eval_paths)に入っているidを除いた残りから取る。学習に使っていない分割だけを使うので、
+    Tを決めるのに使っても評価セットの数字は汚れない。"""
+    from data.convert import chabsa, jcola_noul, jcommonsenseqa, jnli_noul, jsick_score, jsnli, jsts_score
+    from scripts.build_judgment_mix import balance_binary
+
+    exclude = {ex.id for p in eval_paths for ex in load(p)}
+    rng = random.Random(seed)
+    keep = lambda exs: [e for e in exs if e.id not in exclude]
+
+    def take_balanced(exs, per_class):
+        by_answer: dict[str, list] = {}
+        for ex in balance_binary(keep(exs), seed):
+            by_answer.setdefault(ex.candidates[ex.label], []).append(ex)
+        return [ex for v in by_answer.values() for ex in rng.sample(v, min(per_class, len(v)))]
+
+    dev = raw_dir / "jsnli_1.1" / "dev.tsv"
+    if not dev.exists():
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["curl", "-sL", "-o", str(raw_dir / "jsnli.zip"), "https://nlp.ist.i.kyoto-u.ac.jp/nl-resource/JSNLI/jsnli_1.1.zip"], check=True)
+        subprocess.run(["unzip", "-o", "-q", str(raw_dir / "jsnli.zip"), "-d", str(raw_dir)], check=True)
+    jcola_valid = jcola_noul.convert("in_domain_valid") + jcola_noul.convert("out_of_domain_valid")
+    parts = {
+        "commonsense_qa": keep(jcommonsenseqa.convert("validation")),
+        "sentiment": keep(chabsa.convert("test")),
+        "nli": keep([ex.model_copy(update={"id": f"dev_{ex.id}"}) for ex in jsnli.convert(dev)]),
+        "jsts_score": keep(jsts_score.convert("validation")),
+        "jsick_score": keep(jsick_score.convert("test")),
+    }
+    picked = []
+    for name, pool in parts.items():
+        chosen = rng.sample(pool, min(n_per_task, len(pool)))
+        picked.extend(ex.model_copy(update={"task_type": name}) for ex in chosen)
+    for name, exs in (("jnli_noul", jnli_noul.convert("test")), ("jcola_noul", jcola_valid)):
+        picked.extend(ex.model_copy(update={"task_type": name}) for ex in take_balanced(exs, n_per_task // 2))
+    for name in {e.task_type for e in picked}:
+        print(f"calibration {name}: {sum(e.task_type == name for e in picked)}")
+    return shuffle_all(picked)
+
+
 def save(examples: list[JevExample], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(ex.model_dump_json() for ex in examples) + "\n", encoding="utf-8")
@@ -135,16 +176,20 @@ def push(path: Path) -> None:
 
 def _main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("stages", nargs="+", choices=["build", "build-extras", "eval-bf16", "eval-ckpt", "push"])
+    ap.add_argument("stages", nargs="+", choices=["build", "build-extras", "build-calib", "eval-bf16", "eval-ckpt", "push"])
     ap.add_argument("--n-per-task", type=int, default=400)
     ap.add_argument("--out", type=Path, default=Path("data/clean_eval.jsonl"))
     ap.add_argument("--checkpoint-dir", default=None, help="eval-ckptで評価するチェックポイントの置き場所")
     ap.add_argument("--tag", default="epoch1", help="eval-ckptで評価するチェックポイントのtag")
+    ap.add_argument("--exclude", type=Path, nargs="*", default=[Path("data/clean_eval.jsonl"), Path("data/clean_eval_extras.jsonl")],
+                    help="build-calibで除外する評価セット(idが重ならないようにする)")
     a = ap.parse_args()
     if "build" in a.stages:
         save(build(a.n_per_task), a.out)
     if "build-extras" in a.stages:
         save(build_extras(), a.out)
+    if "build-calib" in a.stages:
+        save(build_calibration(a.exclude), a.out)
     examples = load(a.out)
     print(f"clean eval set: {len(examples)} examples from {a.out}")
     if "eval-bf16" in a.stages:
