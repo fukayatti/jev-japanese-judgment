@@ -8,6 +8,8 @@
 学習データと重なっていた(README参照)。こちらが本当のhold-out評価。
 
 Colabでの例: python -m scripts.build_clean_eval build eval-bf16 push
+追加タスク(noul/score)用: python -m scripts.build_clean_eval build-extras eval-ckpt --out data/clean_eval_extras.jsonl \\
+    --checkpoint-dir <dir> --tag epoch1
 """
 
 import argparse
@@ -49,6 +51,42 @@ def build(n_per_task: int = 400, seed: int = 0, raw_dir: Path = Path("data/raw/j
     return shuffle_all(picked)
 
 
+def build_extras(seed: int = 0) -> list[JevExample]:
+    """noul/score用の未使用データ評価セット。noulはyes/noを半々(200+200)にして、多数派に寄せるだけで
+    高得点になる(JNLIは「いいえ」86%)のを防ぐ。task_typeはデータセットごとに変えて、別々に集計できるようにする。"""
+    from data.convert import jcola_noul, jnli_noul, jsick_score, jsts_score
+    from scripts.build_judgment_mix import balance_binary
+
+    def take_balanced(examples, per_class):
+        balanced = balance_binary(examples, seed)
+        rng = random.Random(seed)
+        by_answer: dict[str, list] = {}
+        for ex in balanced:
+            by_answer.setdefault(ex.candidates[ex.label], []).append(ex)
+        return [ex for v in by_answer.values() for ex in rng.sample(v, min(per_class, len(v)))]
+
+    rng = random.Random(seed)
+    jcola_valid = jcola_noul.convert("in_domain_valid") + jcola_noul.convert("out_of_domain_valid")
+    parts = {
+        "jnli_noul": take_balanced(jnli_noul.convert("test"), 200),
+        "jcola_noul": take_balanced(jcola_valid, 200),
+        "jsts_score": rng.sample(jsts_score.convert("validation"), 400),
+        "jsick_score": rng.sample(jsick_score.convert("test"), 400),
+    }
+    picked = []
+    for name, exs in parts.items():
+        print(f"{name}: {len(exs)}")
+        picked.extend(ex.model_copy(update={"task_type": name}) for ex in exs)
+    return shuffle_all(picked)
+
+
+def eval_checkpoint(examples: list[JevExample], checkpoint_dir: str, tag: str) -> None:
+    from eval.run_eval import load_model_from_checkpoint
+
+    model = load_model_from_checkpoint(checkpoint_dir, tag).eval()
+    print(f"{checkpoint_dir}/{tag}:", _metrics(model, examples))
+
+
 def save(examples: list[JevExample], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(ex.model_dump_json() for ex in examples) + "\n", encoding="utf-8")
@@ -88,24 +126,31 @@ def push(path: Path) -> None:
 
     from scripts.push_to_hub import _get_hf_token
 
+    in_repo = f"eval/{path.name}"
     HfApi(token=_get_hf_token()).upload_file(
-        path_or_fileobj=str(path), path_in_repo=EVAL_PATH_IN_REPO, repo_id=REPO_ID, repo_type="model"
+        path_or_fileobj=str(path), path_in_repo=in_repo, repo_id=REPO_ID, repo_type="model"
     )
-    print(f"pushed -> {EVAL_PATH_IN_REPO}")
+    print(f"pushed -> {in_repo}")
 
 
 def _main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("stages", nargs="+", choices=["build", "eval-bf16", "push"])
+    ap.add_argument("stages", nargs="+", choices=["build", "build-extras", "eval-bf16", "eval-ckpt", "push"])
     ap.add_argument("--n-per-task", type=int, default=400)
     ap.add_argument("--out", type=Path, default=Path("data/clean_eval.jsonl"))
+    ap.add_argument("--checkpoint-dir", default=None, help="eval-ckptで評価するチェックポイントの置き場所")
+    ap.add_argument("--tag", default="epoch1", help="eval-ckptで評価するチェックポイントのtag")
     a = ap.parse_args()
     if "build" in a.stages:
         save(build(a.n_per_task), a.out)
+    if "build-extras" in a.stages:
+        save(build_extras(), a.out)
     examples = load(a.out)
     print(f"clean eval set: {len(examples)} examples from {a.out}")
     if "eval-bf16" in a.stages:
         eval_bf16(examples)
+    if "eval-ckpt" in a.stages:
+        eval_checkpoint(examples, a.checkpoint_dir, a.tag)
     if "push" in a.stages:
         push(a.out)
 

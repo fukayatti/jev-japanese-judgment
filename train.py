@@ -144,10 +144,19 @@ def main(
     checkpoint_every_steps: int = 200,
     use_gradient_checkpointing: bool = True,
     resume_from: str | None = None,
+    init_from: str | None = None,
+    init_checkpoint_dir: str | None = None,
 ):
     """resume_from: 再開したいチェックポイントのtag("latest"や"epoch2"等)。
-    checkpoint_dir配下にそのtagのディレクトリが無いと失敗する。
+    checkpoint_dir配下にそのtagのディレクトリが無いと失敗する。エポック数・ステップ位置も引き継ぐ。
+
+    init_from: 別の学習で得たチェックポイント(LoRA+ヘッド)の重みだけを読み込み、エポック0から新しい
+    学習として始める(追加学習/ファインチューニング用)。init_checkpoint_dirにそのチェックポイントの
+    置き場所を渡す(省略時はcheckpoint_dir)。元のチェックポイントを上書きしないよう、新しい学習の
+    checkpoint_dirは元と別にすること。resume_fromとは同時に使えない。
     """
+    if resume_from and init_from:
+        raise ValueError("resume_from と init_from は同時に使えない")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
     # 実際に流れるのは batch_size × 候補数(最大5) 系列なので、512は必要以上に
@@ -155,7 +164,6 @@ def main(
     collator = JevDataCollator(tokenizer, max_length=256)
 
     model = build_model(use_gradient_checkpointing=use_gradient_checkpointing).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
     train_loader = DataLoader(train_examples, batch_size=batch_size, shuffle=True, collate_fn=collator)
     print(f"training on {len(train_examples)} examples, {len(train_loader)} batches/epoch, device={device}")
@@ -178,6 +186,19 @@ def main(
             f"skipping {resume_skip_steps} step(s) into epoch {start_epoch + 1} "
             "(optimizerは初期状態から再開)"
         )
+    elif init_from:
+        init_dir = init_checkpoint_dir or checkpoint_dir
+        if init_dir is None:
+            raise ValueError("init_from を使うには init_checkpoint_dir か checkpoint_dir を指定すること")
+        load_checkpoint(model, init_dir, init_from)  # 重みだけ使い、meta(エポック数等)は無視する
+        model = model.to(device)
+        print(f"initialized weights from '{init_dir}/{init_from}' (new run, epoch 1 of {epochs})")
+
+    # load_checkpointはmodel.backboneを新しいPeftModelに差し替え、LoRAのパラメータも作り直す。
+    # optimizerをそれより前に作ると、古い(もう使われない)パラメータを握ったままになり、LoRAが
+    # 一切更新されない(小さなモデルで確認: 再読み込み後の学習可能24個のうち旧optimizerが持つのは0個)。
+    # 必ず重みの読み込みが全部終わってから作る。
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
 
     for epoch in range(start_epoch, epochs):
         skip_steps = resume_skip_steps if epoch == start_epoch else 0
