@@ -10,7 +10,7 @@ llama.cppのC++側を改造する必要はない。
   merge    LoRAをf16ベースにマージして量子化(1ファイルで完結する版)
   fetch    公開済みのマージ済みGGUF・head.npz・評価セットをHFから取得(変換不要)
   verify   PyTorch(GPU)版とpooled vector/スコアを比較
-  eval     held-outでaccuracyを測る
+  eval     評価セットでaccuracy/ECEを測る(--eval-file無しは学習と重なるサンプル)
 
 例: python -m scripts.gguf_pipeline setup convert verify eval --quants Q4_0 Q4_K_M
 """
@@ -263,17 +263,18 @@ hidden stateを取り出し、`head.npz` の小さなMLPヘッドを計算する
 
 **推奨: `gguf/jev-*.gguf`(LoRAマージ済み、1ファイルで完結)**
 
-| ファイル | サイズ | 精度 (held-out {n}件) |
-| --- | --- | --- |
+未使用データ{n}件(JCommonsenseQA validation / chABSA test / JSNLI dev)での評価。
+bf16(PyTorch、約2.3GB)は accuracy {bf16_accuracy} / ECE {bf16_ece}。
+
+| ファイル | サイズ | Accuracy | ECE | Brier | NLL |
+| --- | --- | --- | --- | --- | --- |
 {merged_rows}
 
-別ファイル版(`gguf/lfm2-base-*.gguf` + `gguf/jev-lora-f16.gguf`、`--lora` で読み込む):
+Q8_0はbf16とほぼ同じ精度。Q4系はaccuracyが0.4〜0.7ポイント下がり、ECEも少し悪化する
+(n={n}の標準誤差は約0.8ポイントなので、Q4_0とQ4_K_Mの優劣は判別できない)。
 
-| ファイル | サイズ | 精度 (held-out {n}件) |
-| --- | --- | --- |
-{base_rows}
-
-(参考) bf16 PyTorch: 約2.3GB、精度 0.970
+別ファイル版(`gguf/lfm2-base-*.gguf` + `gguf/jev-lora-f16.gguf`、`--lora` で読み込む)は、
+マージ版と同等の精度(学習データと重なる200件での測定値: {base_rows_inline})。
 
 使い方は {github_repo} の `scripts/ask_gguf_lite.py` を参照。ベースモデルの重みを量子化した
 ファイルを含むため、[LFM Open License v1.0]({license_url}) が適用される。
@@ -283,11 +284,29 @@ SIZES = {"Q4_0": "664MB", "Q4_K_M": "698MB", "Q8_0": "1.2GB"}
 BASE_LORA_RESULTS = {"Q4_0": 0.965, "Q4_K_M": 0.955, "Q8_0": 0.97}
 
 
-def push_gguf(p: Paths, merged_results: dict[str, float], n: int = 200) -> None:
+def render_gguf_section(merged_results: dict[str, dict], bf16: dict, n: int) -> str:
+    """merged_results: {"Q4_K_M": {"accuracy":..., "ece":..., "brier":..., "nll":...}, ...}"""
+    from scripts.push_model_to_hub import GITHUB_REPO
+
+    rows = "\n".join(
+        f"| gguf/jev-{q}.gguf | {SIZES.get(q, '?')} | {m['accuracy']:.3f} | {m['ece']:.4f} | {m['brier']:.4f} | {m['nll']:.4f} |"
+        for q, m in merged_results.items()
+    )
+    return GGUF_CARD_SECTION.format(
+        n=n,
+        bf16_accuracy=f"{bf16['accuracy']:.3f}",
+        bf16_ece=f"{bf16['ece']:.4f}",
+        merged_rows=rows,
+        base_rows_inline=", ".join(f"{q} {a}" for q, a in BASE_LORA_RESULTS.items()),
+        github_repo=GITHUB_REPO,
+        license_url=f"https://huggingface.co/{BASE_MODEL_NAME}/blob/main/LICENSE",
+    )
+
+
+def push_gguf(p: Paths, merged_results: dict[str, dict], bf16: dict, n: int = 1200) -> None:
     """マージ済みGGUF(gguf/jev-{q}.gguf)をアップロードし、READMEのGGUF節を更新する。"""
     from huggingface_hub import HfApi, hf_hub_download
 
-    from scripts.push_model_to_hub import GITHUB_REPO
     from scripts.push_to_hub import _get_hf_token
 
     api = HfApi(token=_get_hf_token())
@@ -297,16 +316,7 @@ def push_gguf(p: Paths, merged_results: dict[str, float], n: int = 200) -> None:
 
     card = Path(hf_hub_download(REPO_ID, "README.md", token=api.token, force_download=True)).read_text(encoding="utf-8")
     marker = "\n## GGUF版 (llama.cpp / CPU向け)\n"
-    merged_rows = "\n".join(f"| gguf/jev-{q}.gguf | {SIZES.get(q, '?')} | {a} |" for q, a in merged_results.items())
-    base_rows = "\n".join(f"| gguf/lfm2-base-{q}.gguf | {SIZES.get(q, '?')} | {a} |" for q, a in BASE_LORA_RESULTS.items())
-    section = GGUF_CARD_SECTION.format(
-        n=n,
-        merged_rows=merged_rows,
-        base_rows=base_rows,
-        github_repo=GITHUB_REPO,
-        license_url=f"https://huggingface.co/{BASE_MODEL_NAME}/blob/main/LICENSE",
-    )
-    card = card.split(marker)[0] + section
+    card = card.split(marker)[0] + render_gguf_section(merged_results, bf16, n)
     api.upload_file(path_or_fileobj=card.encode("utf-8"), path_in_repo="README.md", repo_id=REPO_ID)
 
 
@@ -321,7 +331,8 @@ def _main() -> None:
     ap.add_argument("--ngl", type=int, default=0, help="GPUに載せる層数(CUDAビルド時に99など)")
     ap.add_argument("--merged", action="store_true", help="evalでLoRAマージ済みGGUFを使う")
     ap.add_argument("--eval-file", type=Path, help="evalに使うjsonl(build_clean_eval.pyの出力)。省略時は学習と重なるサンプル")
-    ap.add_argument("--results", default="{}", help='pushで使うマージ版の精度のJSON 例: \'{"Q4_0": 0.955}\'')
+    ap.add_argument("--results", default="{}", help="pushで使うマージ版の指標のJSON(量子化名 -> {accuracy,ece,brier,nll})")
+    ap.add_argument("--bf16", default="{}", help="bf16の指標のJSON({accuracy,ece})")
     a = ap.parse_args()
     p = Paths(a.work)
     if "setup" in a.stages:
@@ -337,7 +348,7 @@ def _main() -> None:
     if "eval" in a.stages:
         eval_heldout(p, a.quants, a.n, merged=a.merged, eval_file=a.eval_file, ngl=a.ngl)
     if "push" in a.stages:
-        push_gguf(p, json.loads(a.results), a.n)
+        push_gguf(p, json.loads(a.results), json.loads(a.bf16), a.n)
 
 
 if __name__ == "__main__":
