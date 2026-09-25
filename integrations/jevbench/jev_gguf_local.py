@@ -6,6 +6,7 @@
   JEV_LLAMA_SERVER      llama-server バイナリのパス
   JEV_HEAD              head.npz のパス
   JEV_THREADS           スレッド数(既定4)
+  JEV_CTX               サーバーのコンテキスト長(既定16384)。llama-serverはリクエスト全体でこの長さを共有する
   JEV_OPTION_MODE       label(既定) | criteria : 候補文にラベルそのものを使うか、採点基準の説明文を使うか
 """
 from __future__ import annotations
@@ -34,6 +35,7 @@ class JevGgufLocalAdapter:
         self.price_output_per_m = 0.0
         self.revision = revision
         self.option_mode = os.environ.get("JEV_OPTION_MODE", "label")
+        self._ctx = int(os.environ.get("JEV_CTX", "16384"))
         self._ready = False
         self._proc = None
 
@@ -51,7 +53,7 @@ class JevGgufLocalAdapter:
             sock.bind(("127.0.0.1", 0))
             port = int(os.environ.get("JEV_PORT") or sock.getsockname()[1])
         cmd = [os.environ["JEV_LLAMA_SERVER"], "-m", self.endpoint, "--embeddings", "--pooling", "last",
-               "-t", os.environ.get("JEV_THREADS", "4"), "-c", "4096", "-b", "4096", "-ub", "4096",
+               "-t", os.environ.get("JEV_THREADS", "4"), "-c", str(self._ctx), "-b", str(self._ctx), "-ub", str(self._ctx),
                "-ngl", os.environ.get("JEV_NGL", "0"), "--no-warmup", "--host", "127.0.0.1", "--port", str(port)]
         self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         atexit.register(self.close)
@@ -90,6 +92,24 @@ class JevGgufLocalAdapter:
             question += "\nAnswer with yes or no."
         return {"state": state, "question": question, "labels": labels, "options": options, "qtype": qtype}
 
+    def _embed(self, texts):
+        """全候補を1リクエストに束ねると、長い問題では合計トークンがコンテキストを超える(実際にHTTP 500になった)。
+        1文字=1トークンという最悪の見積もりで、収まる範囲ごとに分けて送る。短い問題は従来どおり1回で送る。"""
+        limit = int(self._ctx * 0.9)
+        chunks, cur, cur_n = [], [], 0
+        for t in texts:
+            if cur and cur_n + len(t) > limit:
+                chunks.append(cur)
+                cur, cur_n = [], 0
+            cur.append(t)
+            cur_n += len(t)
+        if cur:
+            chunks.append(cur)
+        out = []
+        for c in chunks:
+            out.extend(self._lite.embed_server(self._url, c))
+        return out
+
     def run(self, task):
         result = DecisionResult(adapter=self.name, ok=False, probs_source="native", model=self.model)
         request = self.build_request(task, self.option_mode)
@@ -99,7 +119,7 @@ class JevGgufLocalAdapter:
             self.load()
             started = time.perf_counter()
             texts = [f"{request['state']}\n{request['question']}\n{o}" for o in request["options"]]
-            embeddings = self._lite.embed_server(self._url, texts)
+            embeddings = self._embed(texts)
             scores = [self._lite.head_score(self._head, x) for x in embeddings]
             m = max(scores)
             exps = [math.exp(s - m) for s in scores]
