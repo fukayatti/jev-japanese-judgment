@@ -10,9 +10,11 @@
 """
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -44,13 +46,19 @@ class JevGgufLocalAdapter:
 
         self._lite = lite
         self._head = lite.load_head(os.environ["JEV_HEAD"])
-        port = int(os.environ.get("JEV_PORT", "8091"))
+        # 前回の中断で古いサーバーが残っていても混ざらないよう、空きポートを使う
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = int(os.environ.get("JEV_PORT") or sock.getsockname()[1])
         cmd = [os.environ["JEV_LLAMA_SERVER"], "-m", self.endpoint, "--embeddings", "--pooling", "last",
                "-t", os.environ.get("JEV_THREADS", "4"), "-c", "4096", "-b", "4096", "-ub", "4096",
                "-ngl", os.environ.get("JEV_NGL", "0"), "--no-warmup", "--host", "127.0.0.1", "--port", str(port)]
         self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        atexit.register(self.close)
         self._url = f"http://127.0.0.1:{port}"
         lite.wait_ready(self._url, self._proc)
+        if self._proc.poll() is not None:
+            raise RuntimeError("llama-server が起動直後に終了した(ポート競合やGPUメモリ不足の可能性)")
         self._ready = True
 
     def close(self):
@@ -105,6 +113,9 @@ class JevGgufLocalAdapter:
         except Exception as exc:  # noqa: BLE001
             result.latency_s = time.perf_counter() - started
             result.error = f"{type(exc).__name__}: {str(exc)[:300]}"
+            self._errors_shown = getattr(self, "_errors_shown", 0) + 1
+            if self._errors_shown <= 3:
+                print(f"[jev_gguf_local] {task.id}: {result.error}", file=sys.stderr, flush=True)
         return result
 
     def reserve_estimate(self, task):
