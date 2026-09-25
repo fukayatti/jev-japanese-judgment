@@ -32,7 +32,8 @@ SEP = "<#sep#>"
 
 
 class Paths:
-    def __init__(self, work: str):
+    def __init__(self, work: str, repo: str = REPO_ID):
+        self.repo = repo  # LoRA+ヘッドを取得するHFモデルリポジトリ(v2など別リポジトリを指せる)
         self.work = Path(work)
         self.llama = self.work / "llama.cpp"
         self.bin = self.llama / "build" / "bin"
@@ -58,7 +59,7 @@ def _run(cmd: list, **kw) -> None:
 
 
 def setup(p: Paths, cuda: bool = False, cuda_arch: str = "75") -> None:
-    """cuda=Trueでllama.cppをCUDA対応でビルドする(評価用にllama-embeddingだけ。T4はarch=75、10分前後かかる)。"""
+    """cuda=Trueでllama.cppをCUDA対応でビルドする(T4はarch=75、10分前後かかる)。llama-serverはJevBench用。"""
     p.work.mkdir(parents=True, exist_ok=True)
     if not p.llama.exists():
         _run(["git", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp", p.llama])
@@ -66,7 +67,7 @@ def setup(p: Paths, cuda: bool = False, cuda_arch: str = "75") -> None:
     if cuda:
         flags += ["-DGGML_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}"]
     _run(["cmake", "-B", "build", *flags], cwd=p.llama)
-    targets = ["llama-embedding"] if cuda else ["llama-quantize", "llama-embedding", "llama-export-lora"]
+    targets = ["llama-quantize", "llama-embedding", "llama-export-lora", "llama-server"]
     _run(["cmake", "--build", "build", "-j", "--target", *targets], cwd=p.llama)
     _run(["pip", "install", "-q", "-e", p.llama / "gguf-py", "sentencepiece", "protobuf", "safetensors"])
 
@@ -76,7 +77,7 @@ def convert(p: Paths, quants: list[str]) -> None:
     from safetensors.torch import load_file, save_file
 
     base_dir = snapshot_download(BASE_MODEL_NAME)
-    hub_dir = snapshot_download(REPO_ID, local_dir=str(p.hub))
+    hub_dir = snapshot_download(p.repo, local_dir=str(p.hub))
     conv = p.llama / "convert_hf_to_gguf.py"
     lora_conv = p.llama / "convert_lora_to_gguf.py"
     py = "python"
@@ -117,8 +118,8 @@ def fetch_published(p: Paths, quants: list[str]) -> None:
 
     p.work.mkdir(parents=True, exist_ok=True)
     for q in quants:
-        shutil.copyfile(hf_hub_download(REPO_ID, f"gguf/jev-{q}.gguf"), p.merged(q))
-    shutil.copyfile(hf_hub_download(REPO_ID, "gguf/head.npz"), p.head_npz)
+        shutil.copyfile(hf_hub_download(p.repo, f"gguf/jev-{q}.gguf"), p.merged(q))
+    shutil.copyfile(hf_hub_download(p.repo, "gguf/head.npz"), p.head_npz)
     shutil.copyfile(hf_hub_download(REPO_ID, "eval/clean_eval.jsonl"), p.work / "clean_eval.jsonl")
 
 
@@ -185,7 +186,7 @@ def verify(p: Paths, qtypes: list[str]) -> None:
     from transformers import AutoTokenizer
 
     texts = [f"\n日本の首都はどこ？\n{c}" for c in ["東京", "大阪", "京都", "名古屋"]]
-    model = load_model_from_hub(REPO_ID, device="cuda").eval()
+    model = load_model_from_hub(p.repo, device="cuda").eval()
     tok = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
     ref_pooled, ref_scores = [], []
     with torch.no_grad():
@@ -326,6 +327,7 @@ def _main() -> None:
     ap.add_argument("--work", default="/content/gguf_work")
     ap.add_argument("--quants", nargs="+", default=["Q4_0", "Q4_K_M", "Q8_0"])
     ap.add_argument("--n", type=int, default=200, help="evalで使う件数(--eval-file使用時、0で全件)")
+    ap.add_argument("--repo", default=REPO_ID, help="LoRA+ヘッドがあるHFモデルリポジトリ(既定はv1)")
     ap.add_argument("--cuda", action="store_true", help="setupでCUDA対応ビルド(Colab GPU用)")
     ap.add_argument("--cuda-arch", default="75", help="CUDAアーキテクチャ(T4=75)")
     ap.add_argument("--ngl", type=int, default=0, help="GPUに載せる層数(CUDAビルド時に99など)")
@@ -334,7 +336,7 @@ def _main() -> None:
     ap.add_argument("--results", default="{}", help="pushで使うマージ版の指標のJSON(量子化名 -> {accuracy,ece,brier,nll})")
     ap.add_argument("--bf16", default="{}", help="bf16の指標のJSON({accuracy,ece})")
     a = ap.parse_args()
-    p = Paths(a.work)
+    p = Paths(a.work, a.repo)
     if "setup" in a.stages:
         setup(p, a.cuda, a.cuda_arch)
     if "convert" in a.stages:
