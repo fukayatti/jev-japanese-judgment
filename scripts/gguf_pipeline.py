@@ -7,6 +7,7 @@ llama.cppのC++側を改造する必要はない。
 ステージ(Colabで上から順に実行する想定):
   setup    llama.cppをclone・ビルド
   convert  ベース→f16 GGUF→量子化、LoRA→GGUF(キー名に"model."を補う)
+  merge    LoRAをf16ベースにマージして量子化(1ファイルで完結する版)
   verify   PyTorch(GPU)版とpooled vector/スコアを比較
   eval     held-outでaccuracyを測る
 
@@ -42,6 +43,13 @@ class Paths:
     def quant(self, qtype: str) -> Path:
         return self.work / f"lfm2-base-{qtype}.gguf"
 
+    @property
+    def merged_f16(self) -> Path:
+        return self.work / "merged-f16.gguf"
+
+    def merged(self, qtype: str) -> Path:
+        return self.work / f"merged-{qtype}.gguf"
+
 
 def _run(cmd: list, **kw) -> None:
     print("+", " ".join(map(str, cmd)))
@@ -53,7 +61,7 @@ def setup(p: Paths) -> None:
     if not p.llama.exists():
         _run(["git", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp", p.llama])
     _run(["cmake", "-B", "build", "-DGGML_NATIVE=ON", "-DLLAMA_CURL=OFF"], cwd=p.llama)
-    _run(["cmake", "--build", "build", "-j", "--target", "llama-quantize", "llama-embedding"], cwd=p.llama)
+    _run(["cmake", "--build", "build", "-j", "--target", "llama-quantize", "llama-embedding", "llama-export-lora"], cwd=p.llama)
     _run(["pip", "install", "-q", "-e", p.llama / "gguf-py", "sentencepiece", "protobuf", "safetensors"])
 
 
@@ -86,6 +94,15 @@ def convert(p: Paths, quants: list[str]) -> None:
     export_head_npz(p)
 
 
+def merge(p: Paths, quants: list[str]) -> None:
+    """LoRA(GGUF)をf16のベースへマージし、そこから量子化する(1ファイルで完結する版)。"""
+    if not p.merged_f16.exists():
+        _run([p.bin / "llama-export-lora", "-m", p.f16, "--lora", p.lora, "-o", p.merged_f16])
+    for q in quants:
+        if not p.merged(q).exists():
+            _run([p.bin / "llama-quantize", p.merged_f16, p.merged(q), q])
+
+
 def export_head_npz(p: Paths) -> None:
     """head.pt(torch形式)を、torch無しでも読めるnpzに書き出す。"""
     import torch
@@ -105,7 +122,9 @@ class GGUFScorer:
         self.w = dict(np.load(head_npz))
 
     @classmethod
-    def from_paths(cls, p: "Paths", qtype: str, threads: int = 4) -> "GGUFScorer":
+    def from_paths(cls, p: "Paths", qtype: str, threads: int = 4, merged: bool = False) -> "GGUFScorer":
+        if merged:
+            return cls(p.merged(qtype), None, p.bin / "llama-embedding", p.head_npz, threads)
         model = p.f16 if qtype == "f16" else p.quant(qtype)
         return cls(model, p.lora, p.bin / "llama-embedding", p.head_npz, threads)
 
@@ -164,7 +183,7 @@ def verify(p: Paths, qtypes: list[str]) -> None:
         print(f"[{q}] cos={np.round(cos, 4)} scores={np.round(sc.head(g), 2)}")
 
 
-def eval_heldout(p: Paths, qtypes: list[str], n: int) -> None:
+def eval_heldout(p: Paths, qtypes: list[str], n: int, merged: bool = False) -> None:
     from collections import defaultdict
 
     from data.postprocess.split import train_val_split
@@ -173,52 +192,67 @@ def eval_heldout(p: Paths, qtypes: list[str], n: int) -> None:
     _, val = train_val_split(pull(repo_id=REPO_ID), val_size=200, seed=0)
     val = val[:n]
     for q in qtypes:
-        sc = GGUFScorer.from_paths(p, q)
+        sc = GGUFScorer.from_paths(p, q, merged=merged)
         preds = sc.scores(val)
         ok, tot = defaultdict(int), defaultdict(int)
         for ex, s in zip(val, preds):
             ok[ex.task_type] += int(np.argmax(s) == ex.label)
             tot[ex.task_type] += 1
         overall = sum(ok.values()) / len(val)
-        print(f"[{q}] overall={overall:.3f} n={len(val)}", {t: round(ok[t] / tot[t], 3) for t in tot})
+        label = f"merged-{q}" if merged else q
+        print(f"[{label}] overall={overall:.3f} n={len(val)}", {t: round(ok[t] / tot[t], 3) for t in tot})
 
 
 GGUF_CARD_SECTION = """
 ## GGUF版 (llama.cpp / CPU向け)
 
-`gguf/` にllama.cpp用のGGUF一式を置いている。バックボーン(量子化済み)とLoRA(f16)を別ファイルで
-持ち、`llama-embedding --pooling last` で最終トークンのhidden stateを取り出し、`head.npz` の
-小さなMLPヘッドをnumpyで計算する(torch/transformers/peft不要)。
+`gguf/` にllama.cpp用のGGUFを置いている。`llama-embedding --pooling last` で最終トークンの
+hidden stateを取り出し、`head.npz` の小さなMLPヘッドを計算する(torch/transformers/peft不要)。
+
+**推奨: `gguf/jev-*.gguf`(LoRAマージ済み、1ファイルで完結)**
 
 | ファイル | サイズ | 精度 (held-out {n}件) |
 | --- | --- | --- |
-{rows}
-| (参考) bf16 PyTorch | 約2.3GB | 0.970 |
+{merged_rows}
 
-使い方は {github_repo} の `scripts/ask_gguf.py` を参照。ベースモデルの重みを量子化したファイルを
-含むため、[LFM Open License v1.0]({license_url}) が適用される。
+別ファイル版(`gguf/lfm2-base-*.gguf` + `gguf/jev-lora-f16.gguf`、`--lora` で読み込む):
+
+| ファイル | サイズ | 精度 (held-out {n}件) |
+| --- | --- | --- |
+{base_rows}
+
+(参考) bf16 PyTorch: 約2.3GB、精度 0.970
+
+使い方は {github_repo} の `scripts/ask_gguf_lite.py` を参照。ベースモデルの重みを量子化した
+ファイルを含むため、[LFM Open License v1.0]({license_url}) が適用される。
 """
 
 SIZES = {"Q4_0": "664MB", "Q4_K_M": "698MB", "Q8_0": "1.2GB"}
+BASE_LORA_RESULTS = {"Q4_0": 0.965, "Q4_K_M": 0.955, "Q8_0": 0.97}
 
 
-def push_gguf(p: Paths, qtypes: list[str], results: dict[str, float], n: int = 200) -> None:
+def push_gguf(p: Paths, merged_results: dict[str, float], n: int = 200) -> None:
+    """マージ済みGGUF(gguf/jev-{q}.gguf)をアップロードし、READMEのGGUF節を更新する。"""
     from huggingface_hub import HfApi, hf_hub_download
 
     from scripts.push_model_to_hub import GITHUB_REPO
     from scripts.push_to_hub import _get_hf_token
 
     api = HfApi(token=_get_hf_token())
-    for q in qtypes:
-        api.upload_file(path_or_fileobj=str(p.quant(q)), path_in_repo=f"gguf/lfm2-base-{q}.gguf", repo_id=REPO_ID)
-    api.upload_file(path_or_fileobj=str(p.lora), path_in_repo="gguf/jev-lora-f16.gguf", repo_id=REPO_ID)
+    for q in merged_results:
+        api.upload_file(path_or_fileobj=str(p.merged(q)), path_in_repo=f"gguf/jev-{q}.gguf", repo_id=REPO_ID)
     api.upload_file(path_or_fileobj=str(p.head_npz), path_in_repo="gguf/head.npz", repo_id=REPO_ID)
 
-    card = Path(hf_hub_download(REPO_ID, "README.md", token=api.token)).read_text(encoding="utf-8")
+    card = Path(hf_hub_download(REPO_ID, "README.md", token=api.token, force_download=True)).read_text(encoding="utf-8")
     marker = "\n## GGUF版 (llama.cpp / CPU向け)\n"
-    rows = "\n".join(f"| gguf/lfm2-base-{q}.gguf | {SIZES.get(q, '?')} | {results[q]} |" for q in qtypes)
+    merged_rows = "\n".join(f"| gguf/jev-{q}.gguf | {SIZES.get(q, '?')} | {a} |" for q, a in merged_results.items())
+    base_rows = "\n".join(f"| gguf/lfm2-base-{q}.gguf | {SIZES.get(q, '?')} | {a} |" for q, a in BASE_LORA_RESULTS.items())
     section = GGUF_CARD_SECTION.format(
-        n=n, rows=rows, github_repo=GITHUB_REPO, license_url=f"https://huggingface.co/{BASE_MODEL_NAME}/blob/main/LICENSE"
+        n=n,
+        merged_rows=merged_rows,
+        base_rows=base_rows,
+        github_repo=GITHUB_REPO,
+        license_url=f"https://huggingface.co/{BASE_MODEL_NAME}/blob/main/LICENSE",
     )
     card = card.split(marker)[0] + section
     api.upload_file(path_or_fileobj=card.encode("utf-8"), path_in_repo="README.md", repo_id=REPO_ID)
@@ -226,23 +260,26 @@ def push_gguf(p: Paths, qtypes: list[str], results: dict[str, float], n: int = 2
 
 def _main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("stages", nargs="+", choices=["setup", "convert", "verify", "eval", "push"])
+    ap.add_argument("stages", nargs="+", choices=["setup", "convert", "merge", "verify", "eval", "push"])
     ap.add_argument("--work", default="/content/gguf_work")
     ap.add_argument("--quants", nargs="+", default=["Q4_0", "Q4_K_M", "Q8_0"])
     ap.add_argument("--n", type=int, default=200, help="evalで使う件数")
-    ap.add_argument("--results", default="{}", help='pushで使う精度のJSON 例: \'{"Q4_0": 0.965}\'')
+    ap.add_argument("--merged", action="store_true", help="evalでLoRAマージ済みGGUFを使う")
+    ap.add_argument("--results", default="{}", help='pushで使うマージ版の精度のJSON 例: \'{"Q4_0": 0.955}\'')
     a = ap.parse_args()
     p = Paths(a.work)
     if "setup" in a.stages:
         setup(p)
     if "convert" in a.stages:
         convert(p, a.quants)
+    if "merge" in a.stages:
+        merge(p, a.quants)
     if "verify" in a.stages:
         verify(p, a.quants)
     if "eval" in a.stages:
-        eval_heldout(p, a.quants, a.n)
+        eval_heldout(p, a.quants, a.n, merged=a.merged)
     if "push" in a.stages:
-        push_gguf(p, a.quants, json.loads(a.results))
+        push_gguf(p, json.loads(a.results), a.n)
 
 
 if __name__ == "__main__":
