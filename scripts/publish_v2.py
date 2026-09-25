@@ -140,7 +140,10 @@ tags:
 
 - JCoLA(文法的な自然さ)は58.0%で、チャンス(50%)に近い。文法性の判定は、この規模の追加学習ではほとんど身についていない。
 - 元の3タスクは、v1から全体で約1.5ポイント下がり、ECEもやや悪化している(1回の学習の結果で、ばらつきは未測定)。
-- 学習した範囲(日本語の常識QA、感情、含意、文のペアの類似度、文法性)の外では、確率が自信過剰になる(JevBenchのECEは0.14〜0.21)。
+- 学習した範囲(日本語の常識QA、感情、含意、文のペアの類似度、文法性)の外では、確率の校正がずれる(JevBenchのECEは0.14〜0.21)。
+  向きが難しさで逆で、易しい問題(easy)は確率が低すぎ(自信不足、NLL最適の温度T=0.4)、難しい問題(original/hard)は高すぎ
+  (自信過剰、最適T=2.1/5.1)なので、温度スケーリング1つでは直せない。日本語の範囲内は最適T≈1.1〜1.2でほぼ校正済みで、
+  温度を入れてもECEの改善は評価セットによっては悪化する程度に小さかったため、適用していない。
 - chABSAのtestは文単位の分割のため、同じ企業文書の別文が学習に含まれる可能性がある。
 
 ## ライセンス
@@ -159,6 +162,7 @@ def main() -> None:
     ap.add_argument("--quants", nargs="+", default=["Q4_K_M", "Q8_0"])
     ap.add_argument("--public", action="store_true", help="アップロード後にリポジトリを公開にする")
     ap.add_argument("--dry-run", action="store_true", help="カードをローカルに書き出すだけ(送信しない)")
+    ap.add_argument("--card-only", action="store_true", help="README.mdだけ更新する(GGUFは再アップロードしない)")
     ap.add_argument("--out", type=Path, default=Path("README_v2_card.md"))
     a = ap.parse_args()
 
@@ -179,9 +183,10 @@ def main() -> None:
 
     api = HfApi(token=_get_hf_token())
     work = Path(a.work)
-    for q in a.quants:
-        api.upload_file(path_or_fileobj=str(work / f"merged-{q}.gguf"), path_in_repo=f"gguf/jev-{q}.gguf", repo_id=V2_REPO)
-    api.upload_file(path_or_fileobj=str(work / "head.npz"), path_in_repo="gguf/head.npz", repo_id=V2_REPO)
+    if not a.card_only:
+        for q in a.quants:
+            api.upload_file(path_or_fileobj=str(work / f"merged-{q}.gguf"), path_in_repo=f"gguf/jev-{q}.gguf", repo_id=V2_REPO)
+        api.upload_file(path_or_fileobj=str(work / "head.npz"), path_in_repo="gguf/head.npz", repo_id=V2_REPO)
     api.upload_file(path_or_fileobj=card.encode("utf-8"), path_in_repo="README.md", repo_id=V2_REPO)
     if a.public:
         api.update_repo_settings(repo_id=V2_REPO, private=False)
