@@ -36,12 +36,14 @@ REPO_ID = "fukayatti0/jev-japanese-judgment"
 SEP = "<#sep#>"
 
 
-def fetch(name: str) -> Path:
-    dest = Path.home() / ".cache" / "jev-gguf" / name
+def fetch(name: str, repo: str = REPO_ID) -> Path:
+    # v1(既定)は従来のキャッシュ場所のまま。別リポジトリ(v2など)は、同名ファイルが混ざらないようサブディレクトリに置く
+    cache = Path.home() / ".cache" / "jev-gguf"
+    dest = (cache if repo == REPO_ID else cache / repo.replace("/", "__")) / name
     if dest.exists():
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
-    url = f"https://huggingface.co/{REPO_ID}/resolve/main/gguf/{name}"
+    url = f"https://huggingface.co/{repo}/resolve/main/gguf/{name}"
     print(f"downloading {url}", flush=True)
     part = dest.with_name(dest.name + ".part")
     with urllib.request.urlopen(url) as r, open(part, "wb") as out:
@@ -143,6 +145,7 @@ def _main() -> None:
     ap.add_argument("--llama-embedding", default=shutil.which("llama-embedding"))
     ap.add_argument("--llama-server", help="llama-serverのパス(省略時は--llama-embeddingと同じディレクトリ)")
     ap.add_argument("--quant", default="Q4_K_M", choices=["Q4_0", "Q4_K_M", "Q8_0"])
+    ap.add_argument("--repo", default=REPO_ID, help="GGUFを取得するHFモデルリポジトリ(v2: fukayatti0/jev-japanese-judgment-v2)")
     ap.add_argument("--model", type=Path, help="LoRAマージ済みGGUFのパス(省略時はHubから取得)")
     ap.add_argument("--lora", type=Path, help="別ファイル版を使う場合のみ: ベースGGUFを--modelに、LoRA GGUFをここに指定")
     ap.add_argument("--head", type=Path, help="head.npzのパス")
@@ -159,13 +162,13 @@ def _main() -> None:
     if not (a.serve or a.repl) and not (a.question and a.candidates):
         raise SystemExit("--question と --candidates を指定するか、--repl / --serve を使うこと")
 
-    a.head = a.head or fetch("head.npz")
+    a.head = a.head or fetch("head.npz", a.repo)
     w = load_head(a.head)
     proc = None
     url = a.server_url
 
     if a.serve or a.repl:
-        a.model = a.model or fetch(f"jev-{a.quant}.gguf")
+        a.model = a.model or fetch(f"jev-{a.quant}.gguf", a.repo)
         server_bin = a.llama_server or str(Path(a.llama_embedding).with_name("llama-server"))
         proc = start_server(server_bin, a.model, a.lora, a.threads, a.port)
         url = f"http://127.0.0.1:{a.port}"
@@ -195,7 +198,7 @@ def _main() -> None:
             if url:
                 embeddings = embed_server(url, texts)
             else:
-                a.model = a.model or fetch(f"jev-{a.quant}.gguf")
+                a.model = a.model or fetch(f"jev-{a.quant}.gguf", a.repo)
                 embeddings = embed(a.llama_embedding, a.model, a.lora, texts, a.threads)
             show(a.question, judge(w, embeddings, candidates))
     except (KeyboardInterrupt, EOFError):
