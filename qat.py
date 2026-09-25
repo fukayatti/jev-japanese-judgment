@@ -1,6 +1,6 @@
 """feed_forward/conv層をint8量子化に強くするためのQAT(Quantization-Aware Training)。
 
-背景: PTQ(学習後量子化)を試した結果、held-out 200件でoverall accuracyが
+背景: PTQ(学習後量子化)を試した結果、学習データと重なる評価用サンプル200件でoverall accuracyが
 97.0%(bf16) -> 89.0%(全層int8) / 86.5%(self_attn除く選択的int8)と、
 どちらも大きく劣化することを実測で確認した。選択的量子化はself_attnを
 守ったにも関わらず全体ではむしろ悪化しており、単純なPTQでは頭打りと判断。

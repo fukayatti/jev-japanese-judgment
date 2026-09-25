@@ -34,7 +34,7 @@ def load(repo_id: str = DEFAULT_REPO_ID, device: str = "cuda", quantize: bool = 
     エラーになった)、モデルの重み自体をbfloat16からfloat32へキャストしてから
     量子化する。
 
-    以下、精度回復を試した経緯(held-out 200件でoverall accuracy):
+    以下、精度回復を試した経緯(学習データと重なる評価用サンプル200件でのoverall accuracy。絶対値は過大、方式間の比較用):
       - bf16フル精度: 97.0%
       - 全層をdefault_dynamic_qconfig(per-tensor)で量子化: 89.0% (nli 79.7%)
       - self_attnを除きper-tensorで量子化(選択的PTQ): 86.5% (悪化、仮説外れ)
