@@ -31,6 +31,8 @@ def main() -> None:
     a = ap.parse_args()
 
     repo = Path(__file__).resolve().parents[2]
+    # JevBench側に置いたアダプタのコピーは、このリポジトリをpullしても更新されない。実行のたびに入れ直して古いコピーを使わない
+    subprocess.run([sys.executable, str(Path(__file__).with_name("install.py")), str(a.jevbench)], check=True)
     env = {**os.environ, "JEV_REPO": str(repo), "JEV_LLAMA_SERVER": a.server, "JEV_HEAD": a.head,
            "JEV_NGL": a.ngl, "JEV_THREADS": a.threads, "JEV_OPTION_MODE": a.option_mode}
     out = (a.out / a.label).resolve()
