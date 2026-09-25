@@ -8,6 +8,7 @@ llama.cppのC++側を改造する必要はない。
   setup    llama.cppをclone・ビルド
   convert  ベース→f16 GGUF→量子化、LoRA→GGUF(キー名に"model."を補う)
   merge    LoRAをf16ベースにマージして量子化(1ファイルで完結する版)
+  fetch    公開済みのマージ済みGGUF・head.npz・評価セットをHFから取得(変換不要)
   verify   PyTorch(GPU)版とpooled vector/スコアを比較
   eval     held-outでaccuracyを測る
 
@@ -56,12 +57,17 @@ def _run(cmd: list, **kw) -> None:
     subprocess.run([str(c) for c in cmd], check=True, **kw)
 
 
-def setup(p: Paths) -> None:
+def setup(p: Paths, cuda: bool = False, cuda_arch: str = "75") -> None:
+    """cuda=Trueでllama.cppをCUDA対応でビルドする(評価用にllama-embeddingだけ。T4はarch=75、10分前後かかる)。"""
     p.work.mkdir(parents=True, exist_ok=True)
     if not p.llama.exists():
         _run(["git", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp", p.llama])
-    _run(["cmake", "-B", "build", "-DGGML_NATIVE=ON", "-DLLAMA_CURL=OFF"], cwd=p.llama)
-    _run(["cmake", "--build", "build", "-j", "--target", "llama-quantize", "llama-embedding", "llama-export-lora"], cwd=p.llama)
+    flags = ["-DGGML_NATIVE=ON", "-DLLAMA_CURL=OFF"]
+    if cuda:
+        flags += ["-DGGML_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}"]
+    _run(["cmake", "-B", "build", *flags], cwd=p.llama)
+    targets = ["llama-embedding"] if cuda else ["llama-quantize", "llama-embedding", "llama-export-lora"]
+    _run(["cmake", "--build", "build", "-j", "--target", *targets], cwd=p.llama)
     _run(["pip", "install", "-q", "-e", p.llama / "gguf-py", "sentencepiece", "protobuf", "safetensors"])
 
 
@@ -103,6 +109,19 @@ def merge(p: Paths, quants: list[str]) -> None:
             _run([p.bin / "llama-quantize", p.merged_f16, p.merged(q), q])
 
 
+def fetch_published(p: Paths, quants: list[str]) -> None:
+    """HFに公開済みのマージ済みGGUF・head.npz・評価セットを作業ディレクトリへ取得する(変換をやり直さず評価だけしたいとき用)。"""
+    import shutil
+
+    from huggingface_hub import hf_hub_download
+
+    p.work.mkdir(parents=True, exist_ok=True)
+    for q in quants:
+        shutil.copyfile(hf_hub_download(REPO_ID, f"gguf/jev-{q}.gguf"), p.merged(q))
+    shutil.copyfile(hf_hub_download(REPO_ID, "gguf/head.npz"), p.head_npz)
+    shutil.copyfile(hf_hub_download(REPO_ID, "eval/clean_eval.jsonl"), p.work / "clean_eval.jsonl")
+
+
 def export_head_npz(p: Paths) -> None:
     """head.pt(torch形式)を、torch無しでも読めるnpzに書き出す。"""
     import torch
@@ -114,7 +133,8 @@ def export_head_npz(p: Paths) -> None:
 class GGUFScorer:
     """llama-embeddingでpooled vectorを取り、numpyでヘッドを計算する。"""
 
-    def __init__(self, model: Path, lora: Path | None, embedding_bin: Path, head_npz: Path, threads: int = 4):
+    def __init__(self, model: Path, lora: Path | None, embedding_bin: Path, head_npz: Path, threads: int = 4, ngl: int = 0):
+        self.ngl = ngl
         self.model = model
         self.lora = lora
         self.embedding_bin = embedding_bin
@@ -122,11 +142,11 @@ class GGUFScorer:
         self.w = dict(np.load(head_npz))
 
     @classmethod
-    def from_paths(cls, p: "Paths", qtype: str, threads: int = 4, merged: bool = False) -> "GGUFScorer":
+    def from_paths(cls, p: "Paths", qtype: str, threads: int = 4, merged: bool = False, ngl: int = 0) -> "GGUFScorer":
         if merged:
-            return cls(p.merged(qtype), None, p.bin / "llama-embedding", p.head_npz, threads)
+            return cls(p.merged(qtype), None, p.bin / "llama-embedding", p.head_npz, threads, ngl)
         model = p.f16 if qtype == "f16" else p.quant(qtype)
-        return cls(model, p.lora, p.bin / "llama-embedding", p.head_npz, threads)
+        return cls(model, p.lora, p.bin / "llama-embedding", p.head_npz, threads, ngl)
 
     def embed(self, texts: list[str]) -> np.ndarray:
         with tempfile.TemporaryDirectory() as tmp:
@@ -136,7 +156,7 @@ class GGUFScorer:
                 self.embedding_bin, "-m", self.model, *(["--lora", self.lora] if self.lora else []),
                 "-f", pf, "--embd-separator", SEP, "--pooling", "last", "--embd-normalize", "-1",
                 "--embd-output-format", "json", "-t", self.threads, "-c", 2048, "-b", 2048, "-ub", 2048,
-                "-ngl", 0, "--no-warmup",
+                "-ngl", self.ngl, "--no-warmup",
             ]
             out = subprocess.run([str(c) for c in cmd], check=True, capture_output=True, text=True).stdout
         return np.array([d["embedding"] for d in json.loads(out)["data"]], dtype=np.float32)
@@ -205,7 +225,9 @@ def calibration_from_scores(scores: list[np.ndarray], labels: list[int], n_bins:
     return {"ece": round(float(ece), 4), "brier": round(float(np.mean(brier)), 4), "nll": round(float(np.mean(nll)), 4)}
 
 
-def eval_heldout(p: Paths, qtypes: list[str], n: int, merged: bool = False, eval_file: Path | None = None) -> None:
+def eval_heldout(
+    p: Paths, qtypes: list[str], n: int, merged: bool = False, eval_file: Path | None = None, ngl: int = 0
+) -> None:
     """eval_file(scripts/build_clean_eval.pyで作った未使用データ)があればそれで、
     無ければ従来の学習データと重なる評価用サンプルで測る(後者は絶対値が過大になる)。"""
     from collections import defaultdict
@@ -221,7 +243,7 @@ def eval_heldout(p: Paths, qtypes: list[str], n: int, merged: bool = False, eval
         _, val = train_val_split(pull(repo_id=REPO_ID), val_size=200, seed=0)
         val = val[:n]
     for q in qtypes:
-        sc = GGUFScorer.from_paths(p, q, merged=merged)
+        sc = GGUFScorer.from_paths(p, q, merged=merged, ngl=ngl)
         preds = sc.scores(val)
         ok, tot = defaultdict(int), defaultdict(int)
         for ex, s in zip(val, preds):
@@ -290,25 +312,30 @@ def push_gguf(p: Paths, merged_results: dict[str, float], n: int = 200) -> None:
 
 def _main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("stages", nargs="+", choices=["setup", "convert", "merge", "verify", "eval", "push"])
+    ap.add_argument("stages", nargs="+", choices=["setup", "convert", "merge", "fetch", "verify", "eval", "push"])
     ap.add_argument("--work", default="/content/gguf_work")
     ap.add_argument("--quants", nargs="+", default=["Q4_0", "Q4_K_M", "Q8_0"])
     ap.add_argument("--n", type=int, default=200, help="evalで使う件数(--eval-file使用時、0で全件)")
+    ap.add_argument("--cuda", action="store_true", help="setupでCUDA対応ビルド(Colab GPU用)")
+    ap.add_argument("--cuda-arch", default="75", help="CUDAアーキテクチャ(T4=75)")
+    ap.add_argument("--ngl", type=int, default=0, help="GPUに載せる層数(CUDAビルド時に99など)")
     ap.add_argument("--merged", action="store_true", help="evalでLoRAマージ済みGGUFを使う")
     ap.add_argument("--eval-file", type=Path, help="evalに使うjsonl(build_clean_eval.pyの出力)。省略時は学習と重なるサンプル")
     ap.add_argument("--results", default="{}", help='pushで使うマージ版の精度のJSON 例: \'{"Q4_0": 0.955}\'')
     a = ap.parse_args()
     p = Paths(a.work)
     if "setup" in a.stages:
-        setup(p)
+        setup(p, a.cuda, a.cuda_arch)
     if "convert" in a.stages:
         convert(p, a.quants)
+    if "fetch" in a.stages:
+        fetch_published(p, a.quants)
     if "merge" in a.stages:
         merge(p, a.quants)
     if "verify" in a.stages:
         verify(p, a.quants)
     if "eval" in a.stages:
-        eval_heldout(p, a.quants, a.n, merged=a.merged, eval_file=a.eval_file)
+        eval_heldout(p, a.quants, a.n, merged=a.merged, eval_file=a.eval_file, ngl=a.ngl)
     if "push" in a.stages:
         push_gguf(p, json.loads(a.results), a.n)
 
