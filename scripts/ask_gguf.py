@@ -22,7 +22,7 @@ def load(quant: str = "Q4_K_M", repo_id: str = REPO_ID, llama_embedding: str | N
     if binary is None:
         raise FileNotFoundError("llama-embedding が見つからない。llama.cppをビルドしてPATHに通すか --llama-embedding で指定すること")
     fetch = lambda name: Path(hf_hub_download(repo_id, f"gguf/{name}"))
-    return GGUFScorer(fetch(f"lfm2-base-{quant}.gguf"), fetch("jev-lora-f16.gguf"), Path(binary), fetch("head.npz"), threads)
+    return GGUFScorer(fetch(f"jev-{quant}.gguf"), None, Path(binary), fetch("head.npz"), threads)
 
 
 def ask(scorer: GGUFScorer, question: str, candidates: list[str], context: str = "") -> dict:

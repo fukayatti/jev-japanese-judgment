@@ -57,16 +57,16 @@ held-out（学習に使っていないデータ）での評価。
 | 方式 | サイズ | Accuracy |
 | --- | --- | --- |
 | bf16（基準、GPU） | 約2.3GB | 97.0% |
-| **GGUF Q8_0 + LoRA**（llama.cpp） | 1.2GB | 97.0% |
-| **GGUF Q4_0 + LoRA**（llama.cpp） | 664MB | 96.5% |
-| **GGUF Q4_K_M + LoRA**（llama.cpp） | 698MB | 95.5% |
+| **GGUF Q8_0**（LoRAマージ済み、llama.cpp） | 1.2GB | 97.0% |
+| **GGUF Q4_0**（LoRAマージ済み） | 664MB | 95.5% |
+| **GGUF Q4_K_M**（LoRAマージ済み） | 698MB | 96.0% |
 | PyTorch 動的int8（per-channel、CPU） | - | 89.5% |
 
 n=200なので誤差は約±1.3ポイント（Q4_0とQ4_K_Mの優劣は判別できない）。PyTorchの動的int8は精度が大きく落ちるため、ローカル実行にはGGUF版を推奨する。選択的量子化・QAT・ONNXも試したが、精度悪化または変換不可で不採用（`qat.py`、`scripts/ask.py` のdocstringに経緯を記載）。
 
 ### GGUF版（推奨）
 
-llama.cppでバックボーン+LoRAを動かし（`--pooling last` で最終トークンのhidden stateを取得）、自作ヘッド（小さなMLP）はPython側で計算する。llama.cppのC++側の改造は不要。
+LoRAをマージした1ファイルのGGUFをllama.cppで動かし（`--pooling last` で最終トークンのhidden stateを取得）、自作ヘッド（小さなMLP）はPython側で計算する。llama.cppのC++側の改造は不要。
 
 ```bash
 # 1. llama.cppをビルド（初回のみ）
@@ -78,7 +78,7 @@ python3 scripts/ask_gguf_lite.py --llama-embedding llama.cpp/build/bin/llama-emb
   --question "日本の首都はどこ？" --candidates "大阪,東京,京都,名古屋"
 ```
 
-`scripts/ask_gguf.py` はnumpy + huggingface_hubを使う同等版。`--quant Q8_0` などで量子化タイプを選べる（初回のみ追加ダウンロード）。GGUF変換・評価・公開は `python -m scripts.gguf_pipeline`（Colab想定）。
+LoRAをマージしていない別ファイル版（`gguf/lfm2-base-*.gguf` + `gguf/jev-lora-f16.gguf`）もHFにあり、`--model` / `--lora` で指定できる（精度は同等）。`scripts/ask_gguf.py` はnumpy + huggingface_hubを使う同等版。`--quant Q8_0` などで量子化タイプを選べる（初回のみ追加ダウンロード）。GGUF変換・LoRAマージ・評価・公開は `python -m scripts.gguf_pipeline`（Colab想定）。
 
 ### PyTorch版（GPUあり / 量子化CPU）
 

@@ -1,7 +1,7 @@
 """GGUF版Jevモデルに質問を投げる、Python標準ライブラリだけ版(numpy/torch不要)。
 
-必要なもの: ビルド済みの llama.cpp の `llama-embedding` だけ。モデルファイルは
---model/--lora/--head で直接指定するか、省略するとHugging Face Hubから
+必要なもの: ビルド済みの llama.cpp の `llama-embedding` だけ。モデルファイル(LoRAマージ済みの
+1ファイル)は --model/--head で直接指定するか、省略するとHugging Face Hubから
 ~/.cache/jev-gguf/ にダウンロードする(標準ライブラリのurllibを使うので追加インストール不要)。
 
 使い方:
@@ -87,21 +87,16 @@ def _main() -> None:
     ap.add_argument("--context", default="")
     ap.add_argument("--llama-embedding", default=shutil.which("llama-embedding"))
     ap.add_argument("--quant", default="Q4_K_M", choices=["Q4_0", "Q4_K_M", "Q8_0"])
-    ap.add_argument("--model", type=Path, help="ベースGGUFのパス(省略時はHubから取得)")
-    ap.add_argument("--lora", type=Path, help="LoRA GGUFのパス")
+    ap.add_argument("--model", type=Path, help="LoRAマージ済みGGUFのパス(省略時はHubから取得)")
+    ap.add_argument("--lora", type=Path, help="別ファイル版を使う場合のみ: ベースGGUFを--modelに、LoRA GGUFをここに指定")
     ap.add_argument("--head", type=Path, help="head.npzのパス")
-    ap.add_argument("--no-lora", action="store_true", help="LoRAを使わない(--modelがLoRAマージ済みの場合)")
     ap.add_argument("--threads", type=int, default=4)
     a = ap.parse_args()
     if not a.llama_embedding:
         raise SystemExit("llama-embedding が見つからない。--llama-embedding で指定すること")
 
-    a.model = a.model or fetch(f"lfm2-base-{a.quant}.gguf")
+    a.model = a.model or fetch(f"jev-{a.quant}.gguf")
     a.head = a.head or fetch("head.npz")
-    if a.no_lora:
-        a.lora = None
-    else:
-        a.lora = a.lora or fetch("jev-lora-f16.gguf")
 
     candidates = [c.strip() for c in a.candidates.split(",") if c.strip()]
     texts = [f"{a.context}\n{a.question}\n{c}" for c in candidates]
