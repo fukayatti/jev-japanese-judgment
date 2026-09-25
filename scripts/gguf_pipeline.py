@@ -183,14 +183,43 @@ def verify(p: Paths, qtypes: list[str]) -> None:
         print(f"[{q}] cos={np.round(cos, 4)} scores={np.round(sc.head(g), 2)}")
 
 
-def eval_heldout(p: Paths, qtypes: list[str], n: int, merged: bool = False) -> None:
+def calibration_from_scores(scores: list[np.ndarray], labels: list[int], n_bins: int = 10) -> dict:
+    """eval/calibration.py と同じ定義のECE/Brier/NLLを、torch無しで計算する(候補数は可変)。"""
+    conf, correct, brier, nll = [], [], [], []
+    for s, y in zip(scores, labels):
+        e = np.exp(s - s.max())
+        pr = e / e.sum()
+        conf.append(pr.max())
+        correct.append(float(pr.argmax() == y))
+        onehot = np.zeros_like(pr)
+        onehot[y] = 1.0
+        brier.append(((pr - onehot) ** 2).sum())
+        nll.append(-np.log(max(pr[y], 1e-12)))
+    conf, correct = np.array(conf), np.array(correct)
+    ece = 0.0
+    edges = np.linspace(0, 1, n_bins + 1)
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (conf > lo) & (conf <= hi)
+        if m.any():
+            ece += m.mean() * abs(correct[m].mean() - conf[m].mean())
+    return {"ece": round(float(ece), 4), "brier": round(float(np.mean(brier)), 4), "nll": round(float(np.mean(nll)), 4)}
+
+
+def eval_heldout(p: Paths, qtypes: list[str], n: int, merged: bool = False, eval_file: Path | None = None) -> None:
+    """eval_file(scripts/build_clean_eval.pyで作った未使用データ)があればそれで、
+    無ければ従来の学習データと重なる評価用サンプルで測る(後者は絶対値が過大になる)。"""
     from collections import defaultdict
 
-    from data.postprocess.split import train_val_split
-    from scripts.push_to_hub import pull
+    if eval_file:
+        from scripts.build_clean_eval import load
 
-    _, val = train_val_split(pull(repo_id=REPO_ID), val_size=200, seed=0)
-    val = val[:n]
+        val = load(eval_file)[:n] if n else load(eval_file)
+    else:
+        from data.postprocess.split import train_val_split
+        from scripts.push_to_hub import pull
+
+        _, val = train_val_split(pull(repo_id=REPO_ID), val_size=200, seed=0)
+        val = val[:n]
     for q in qtypes:
         sc = GGUFScorer.from_paths(p, q, merged=merged)
         preds = sc.scores(val)
@@ -200,7 +229,8 @@ def eval_heldout(p: Paths, qtypes: list[str], n: int, merged: bool = False) -> N
             tot[ex.task_type] += 1
         overall = sum(ok.values()) / len(val)
         label = f"merged-{q}" if merged else q
-        print(f"[{label}] overall={overall:.3f} n={len(val)}", {t: round(ok[t] / tot[t], 3) for t in tot})
+        cal = calibration_from_scores(preds, [ex.label for ex in val])
+        print(f"[{label}] overall={overall:.3f} n={len(val)}", {t: round(ok[t] / tot[t], 3) for t in tot}, cal, flush=True)
 
 
 GGUF_CARD_SECTION = """
@@ -263,8 +293,9 @@ def _main() -> None:
     ap.add_argument("stages", nargs="+", choices=["setup", "convert", "merge", "verify", "eval", "push"])
     ap.add_argument("--work", default="/content/gguf_work")
     ap.add_argument("--quants", nargs="+", default=["Q4_0", "Q4_K_M", "Q8_0"])
-    ap.add_argument("--n", type=int, default=200, help="evalで使う件数")
+    ap.add_argument("--n", type=int, default=200, help="evalで使う件数(--eval-file使用時、0で全件)")
     ap.add_argument("--merged", action="store_true", help="evalでLoRAマージ済みGGUFを使う")
+    ap.add_argument("--eval-file", type=Path, help="evalに使うjsonl(build_clean_eval.pyの出力)。省略時は学習と重なるサンプル")
     ap.add_argument("--results", default="{}", help='pushで使うマージ版の精度のJSON 例: \'{"Q4_0": 0.955}\'')
     a = ap.parse_args()
     p = Paths(a.work)
@@ -277,7 +308,7 @@ def _main() -> None:
     if "verify" in a.stages:
         verify(p, a.quants)
     if "eval" in a.stages:
-        eval_heldout(p, a.quants, a.n, merged=a.merged)
+        eval_heldout(p, a.quants, a.n, merged=a.merged, eval_file=a.eval_file)
     if "push" in a.stages:
         push_gguf(p, json.loads(a.results), a.n)
 
