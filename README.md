@@ -78,6 +78,15 @@ python3 scripts/ask_gguf_lite.py --llama-embedding llama.cpp/build/bin/llama-emb
   --question "日本の首都はどこ？" --candidates "大阪,東京,京都,名古屋"
 ```
 
+毎回モデルを読み込むので1回あたり1.2〜1.6秒かかる。対話的に何度も質問するなら、`llama-server`を内部で常駐させる`--repl`が速い（2問目以降は1問0.5〜0.7秒程度、4スレッドの実測）:
+
+```bash
+python3 scripts/ask_gguf_lite.py --llama-embedding llama.cpp/build/bin/llama-embedding --repl
+# llama-serverも同じディレクトリにビルドしておく: cmake --build build -j2 --target llama-server
+```
+
+`--serve`でサーバーだけ起動しておき、別プロセスから`--server-url http://127.0.0.1:8089 --question ... --candidates ...`で質問することもできる。
+
 LoRAをマージしていない別ファイル版（`gguf/lfm2-base-*.gguf` + `gguf/jev-lora-f16.gguf`）もHFにあり、`--model` / `--lora` で指定できる（精度は同等）。`scripts/ask_gguf.py` はnumpy + huggingface_hubを使う同等版。`--quant Q8_0` などで量子化タイプを選べる（初回のみ追加ダウンロード）。GGUF変換・LoRAマージ・評価・公開は `python -m scripts.gguf_pipeline`（Colab想定）。
 
 ### PyTorch版（GPUあり / 量子化CPU）
